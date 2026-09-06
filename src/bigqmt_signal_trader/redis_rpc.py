@@ -86,6 +86,7 @@ READ_METHODS = {
     "query_account_infos",
     "query_account_status",
     "query_credit_detail",
+    "query_credit_account",
     "query_stk_compacts",
     "query_credit_subjects",
     "query_credit_slo_code",
@@ -148,12 +149,29 @@ LISTENER_DEFERRED_METHODS = {
     "query_account_infos",
     "query_account_status",
     "query_credit_detail",
+    "query_credit_account",
     "query_stk_compacts",
     "query_credit_subjects",
     "query_credit_slo_code",
     "query_credit_assure",
     "query_appointment_info",
     "get_ipo_data",   # 8-28: 交易类查询, 需主线程上下文 (后台线程返回空)
+    # get_ipo_data 上面那条注释适用于所有走 QMT 交易类全局函数的查询，当时只
+    # 修了它一个。真两融账户的体检报告把漏网的挑了出来：同一次运行里
+    # query_stk_compacts -> 52 行、query_credit_subjects -> 71002 行、
+    # query_credit_slo_code -> 50 行，而调同一个 QMT 函数的直连 get_* 全是 0 行。
+    # 两边 handler 逐字节相同、账号相同，唯一差别就是 query_* 在这张表里、
+    # 直连的不在，于是后者跑在后台 listener 线程上 —— 正是 get_ipo_data 当年
+    # 踩的那个坑。孪生方法必须待在同一条线程路径上（#204）。
+    "get_assure_contract",
+    "get_enable_short_contract",
+    "get_unclosed_compacts",
+    "get_closed_compacts",
+    "get_debt_contract",
+    "get_option_subject_position",
+    "get_comb_option",
+    "get_new_purchase_limit",
+    "get_hkt_exchange_rate",
     "query_smt_secu_info",
     "query_smt_secu_rate",
     "get_value_by_order_id",
@@ -203,6 +221,40 @@ CANCELED_ORDER_STATUSES = {"53", "54"}
 # strategy_name=, or once with rpc_default_strategy_name in the config;
 # "" leaves the column blank the way a hand-placed order does.
 DEFAULT_ORDER_STRATEGY_NAME = "bigqmt_rpc"
+# query_credit_account 是查柜台的，官方参考 6.13 原话：「本函数只能有一个查询，
+# 如果前面的查询正在进行中，后面的查询将会提前返回。本函数从服务器查询数据，
+# 建议平均查询时间间隔 30s 一次，不可频繁调用。」所以桥这边自己限流，客户端
+# 想怎么轮询都不会把柜台打爆（#202）。
+# hollow 告警的最小间隔。跑错线程时每一次查询都会 hollow，不节流日志会被刷爆。
+HOLLOW_WARNING_INTERVAL_SECONDS = 60.0
+CREDIT_ACCOUNT_MIN_INTERVAL_SECONDS = 30.0
+# 缓存超过这个年龄就不再交出去。
+#
+# 这条通道的缓存**从不自己刷新** —— 没人调就永远不刷，age_seconds 可以是 44
+# 秒，也可以是三小时。真正的风险不是「30 秒 vs 0 秒」，而是一个只读 rows、
+# 不看 age_seconds 的调用方，拿三小时前的**维持担保比例**去做决策还毫无察觉。
+# 维持担保比例是强平线，读错方向是真损失。
+#
+# 120 秒：官方最小间隔是 30 秒，留够几次调用的余量，又不至于让陈数据在盘中
+# 蒙混过关。要实时的维持担保比例请走 query_credit_detail（同步、读终端本地
+# 缓存、无此问题）。传 0 表示不限制，那是显式放弃这层保护。
+CREDIT_ACCOUNT_MAX_AGE_SECONDS = 120.0
+# 一次 RPC 里最多等回调多久。**默认 0：不等。**
+#
+# handler 跑在 adjust 主线程上（它在 LISTENER_DEFERRED_METHODS 里，必须如此，
+# 否则拿不到交易上下文）。原来这里 sleep 轮询等回调，实盘上（真两融账户、
+# 已确认在大 QMT 里回调能触发）表现是：query_issued=true、等满 8 秒、
+# callbacks_seen=0、无任何报错。
+#
+# 最可能的解释：QMT 把 credit_account_callback 投递到主线程上，而我正用等待
+# 堵着这条线程 —— 用等待堵死了唯一能送达的那条路，回调只可能在 handler 返回
+# 之后才进来。order_callback 走 C++ 线程，这个不一定同理，不能照搬。
+#
+# 所以默认改成「发出去就返回」：这一次拿到的是缓存（或空），回调随后自己落下，
+# 下一次调用就能取到。在两种假设下都安全 —— 如果回调其实走的是 C++ 线程，
+# 代价也只是多一次调用。想等的人显式传 wait_seconds 即可。
+CREDIT_ACCOUNT_DEFAULT_WAIT_SECONDS = 0.0
+CREDIT_ACCOUNT_MAX_WAIT_SECONDS = 10.0
 TERMINAL_NON_CANCEL_ORDER_STATUSES = {"56", "57"}
 # 51 已报待撤 / 52 部成待撤: the exchange has ACCEPTED the cancel and it is
 # on its way. Neither cancelled nor failed -- keep waiting, and at the
@@ -545,6 +597,30 @@ class BigQmtRpcHandlers:
         # Server-side diagnostic for silent failures (e.g. passorder submitted
         # but order not found in system). Surfaced to client via server_error.
         self._last_server_error = ""
+        # 上一次 hollow 告警的时间戳。节流是必须的：一个跑错线程的部署会让
+        # **每一次**交易类查询都 hollow，不节流的话日志会被刷爆（#139 就是
+        # 一行写了 16 次那种教训）。
+        self._last_hollow_warning_at = 0.0
+        # 信用账户的「查柜台」通道（#202）。query_credit_account 是异步的：结果
+        # 只从 credit_account_callback 出来，所以这里存最后一次回调的结果，由
+        # note_credit_account 填。官方 6.13 明说「只能有一个查询」「建议 30s 一
+        # 次，不可频繁调用」，所以单飞 + 最小间隔，不能每个请求都透传下去。
+        self._credit_account_lock = threading.Lock()
+        self._credit_account_rows = []
+        self._credit_account_seq = 0
+        self._credit_account_stamp = 0.0      # 回调落地的时间
+        self._credit_account_asked = 0.0      # 上一次真的发出查询的时间
+        self._credit_account_inflight = False
+        self._credit_account_error = ""
+        # QMT 实际回调了多少次。0 = QMT 没回调；>0 但没数据 = 回调来了但结果
+        # 没落进来。两者的排查方向完全不同，从外面看却一样（#202）。
+        self._credit_account_callbacks = 0
+        # 回调实际落在哪条线程上。adjust 线程 = 等待会把它堵死；C++ 回调线程
+        # = 等待是安全的。这是个事实问题，记下来就不用猜（#202）。
+        self._credit_account_callback_thread = ""
+        self.credit_account_min_interval_seconds = CREDIT_ACCOUNT_MIN_INTERVAL_SECONDS
+        self.credit_account_max_wait_seconds = CREDIT_ACCOUNT_MAX_WAIT_SECONDS
+        self.credit_account_max_age_seconds = CREDIT_ACCOUNT_MAX_AGE_SECONDS
         if allowed_methods is None:
             allowed = set(READ_METHODS)
             if self.allow_order_methods:
@@ -723,7 +799,12 @@ class BigQmtRpcHandlers:
         # True 说明确实拿得到，False 只说明「这条路径上没有」，不等于终端没有。
         info["global_namespace"] = {}
         for name in ("create_sector", "create_sector_folder", "add_sector",
-                     "remove_sector", "remove_stock_from_sector", "reset_sector"):
+                     "remove_sector", "remove_stock_from_sector", "reset_sector",
+                     # query_credit_account 也走这条查：它在 qmt_api 里没有时，
+                     # 要能分清「这台终端根本没有这个函数」和「有但没绑上」。
+                     # 策略侧 _resolve_runtime_name 的兜底正是 builtins，所以
+                     # builtins 里没有就等于这台终端不提供（#202）。
+                     "query_credit_account"):
             found = self.qmt_api.get(name)
             if not callable(found):
                 try:
@@ -734,6 +815,10 @@ class BigQmtRpcHandlers:
             info["global_namespace"][name] = callable(found)
         # 信用接口只读探测：不存在的全局直接标 unavailable；存在的真调一次，
         # 记录是否报错和返回行数（担保品/融券标的可能很多行，只计数）。
+        # get_unclosed_compacts / get_closed_compacts 是两参数签名（accountID,
+        # accountType），单参数调用会撞 boost::python 的 ArgumentError —— 探测
+        # 自己少传一个参数，把一个好用的接口报成 ok:False（#201）。
+        _two_arg = ("get_unclosed_compacts", "get_closed_compacts")
         for name in ("get_assure_contract", "get_enable_short_contract",
                      "get_unclosed_compacts", "get_debt_contract"):
             func = self.qmt_api.get(name)
@@ -741,19 +826,328 @@ class BigQmtRpcHandlers:
                 info["credit_probe"][name] = {"available": False}
                 continue
             try:
-                rows = func(self.account_id) or []
-                info["credit_probe"][name] = {
-                    "available": True, "ok": True, "rows": len(rows),
-                }
+                if name in _two_arg:
+                    rows = func(self.account_id,
+                                self._configured_account_type(self.account_id)) or []
+                else:
+                    rows = func(self.account_id) or []
+                report = {"available": True, "ok": True}
+                report.update(self._describe_probe_rows(rows))
+                info["credit_probe"][name] = report
             except Exception as exc:
                 info["credit_probe"][name] = {
                     "available": True, "ok": False,
                     "error": "%s: %s" % (exc.__class__.__name__, exc),
                 }
+        # 信用账户对象本身（query_credit_detail 的数据源）。空列表有两种成因 ——
+        # 这本账户不是信用账户，还是这台终端读不到 —— m_nBrokerType 能分开：
+        # 3 = 信用。#201 的报告只看到「空列表」，无从判断是哪一种。
+        info["credit_probe"]["get_trade_detail_data(CREDIT,ACCOUNT)"] = \
+            self._probe_credit_account_object()
+        info["credit_callback"] = {
+            "note_credit_account_available": hasattr(self, "note_credit_account"),
+            "callbacks_seen": getattr(self, "_credit_account_callbacks", 0),
+            "cached_rows": len(getattr(self, "_credit_account_rows", []) or []),
+            "last_callback_thread": getattr(self, "_credit_account_callback_thread", ""),
+        }
+        info["thread_routing"] = self._probe_thread_routing()
         info["sector_probe"] = self._probe_sector_channels()
         info["order_watch"] = self._probe_order_watch()
         info["reply_residency"] = self._probe_reply_residency()
         return info
+
+    # ------------------------------------------------------------------
+    # 信用账户「查柜台」通道（#202）
+    # ------------------------------------------------------------------
+
+    def note_credit_account(self, seq, result):
+        """credit_account_callback 的落点。
+
+        QMT 从 C++ 回调线程调进来，所以这里只做「归一化 + 存下来」，绝不碰
+        get_trade_detail_data 之类需要主线程上下文的东西，也绝不抛出去 ——
+        回调里抛异常在 QMT 那边表现为无堆栈的 SystemError。
+        """
+        try:
+            rows = _normalize_detail_rows([result] if result is not None else [])
+        except Exception as exc:
+            with self._credit_account_lock:
+                self._credit_account_callbacks += 1
+                self._credit_account_inflight = False
+                self._credit_account_error = "%s: %s" % (exc.__class__.__name__, exc)
+            return False
+        try:
+            thread_name = threading.current_thread().name
+        except Exception:
+            thread_name = "?"
+        with self._credit_account_lock:
+            self._credit_account_callbacks += 1
+            self._credit_account_callback_thread = thread_name
+            self._credit_account_rows = rows
+            self._credit_account_stamp = time.time()
+            self._credit_account_inflight = False
+            self._credit_account_error = ""
+            try:
+                self._credit_account_seq = int(seq)
+            except Exception:
+                pass
+        return True
+
+    def _issue_credit_account_query(self, account_id):
+        """Fire query_credit_account once, honouring the counter's rate limit.
+
+        Returns (issued, reason). Not issuing is a normal outcome, not a
+        failure: the cached answer is still served.
+        """
+        func = self.qmt_api.get("query_credit_account")
+        if not callable(func):
+            return False, "query_credit_account is not bound in this deployment"
+        context_info = getattr(self.market_data, "context_info", None)
+        if context_info is None:
+            return False, "no ContextInfo available"
+        now = time.time()
+        with self._credit_account_lock:
+            if self._credit_account_inflight:
+                # 兜底：inflight 卡住超过一个最小间隔就当它丢了，重新放行。
+                # 官方说「前一个查询还在进行中，后面的会提前返回」，所以重问
+                # 最坏也就是提前返回；而卡死是永久失去这条通道。
+                stuck_for = now - self._credit_account_asked
+                if stuck_for < self.credit_account_min_interval_seconds:
+                    return False, ("a query is already in flight (%.1fs)"
+                                   % stuck_for)
+                self._credit_account_inflight = False
+            since = now - self._credit_account_asked
+            if self._credit_account_asked and since < self.credit_account_min_interval_seconds:
+                return False, ("rate limited: %.1fs since the last query, minimum %.1fs"
+                               % (since, self.credit_account_min_interval_seconds))
+            self._credit_account_inflight = True
+            self._credit_account_asked = now
+            seq = int(now)
+        try:
+            func(account_id, seq, context_info)
+        except Exception as exc:
+            with self._credit_account_lock:
+                self._credit_account_inflight = False
+                self._credit_account_error = "%s: %s" % (exc.__class__.__name__, exc)
+            return False, self._credit_account_error
+        return True, ""
+
+    def _handle_query_credit_account(self, params):
+        """信用账户明细，查柜台的那条路（官方参考 6.13）。
+
+        query_credit_account(accId, seq, ContextInfo) 是异步的，结果只从
+        credit_account_callback 出来，所以这个 handler 做的是：发一次查询（受
+        30s 最小间隔约束），有界地等回调落地，然后连同「数据是什么时候的、这次
+        有没有真发出去」一起返回。等不到就返回上一次的缓存 —— 但响应里会说清楚
+        stale=true，不会把陈数据冒充新的。
+        """
+        account_id = self._request_account_id(params)
+        wait_seconds = params.get("wait_seconds")
+        if wait_seconds is None:
+            wait_seconds = CREDIT_ACCOUNT_DEFAULT_WAIT_SECONDS
+        wait_seconds = max(0.0, min(self.credit_account_max_wait_seconds,
+                                    float(wait_seconds)))
+        max_age_seconds = params.get("max_age_seconds")
+        if max_age_seconds is None:
+            max_age_seconds = self.credit_account_max_age_seconds
+        max_age_seconds = max(0.0, float(max_age_seconds))
+        with self._credit_account_lock:
+            stamp_before = self._credit_account_stamp
+            known_callback_thread = self._credit_account_callback_thread
+        # 回调如果投递在**本线程**上，等待就永远等不到 —— 我们正占着它。实盘
+        # 实测（真两融账户）：callback_thread="MainThread"，而 handler 也在
+        # MainThread，等满 8 秒 callbacks_seen 不动，那几次回调全是在两次调用
+        # 之间、handler 没占着线程的时候落下的。所以一旦观测到这种情况就不再
+        # 等，直接返回缓存 —— 白等只是把 adjust 主线程按住几秒（#202）。
+        wait_pointless = False
+        if wait_seconds > 0 and known_callback_thread:
+            try:
+                wait_pointless = (known_callback_thread
+                                  == threading.current_thread().name)
+            except Exception:
+                wait_pointless = False
+            if wait_pointless:
+                wait_seconds = 0.0
+        issued, reason = self._issue_credit_account_query(account_id)
+        deadline = time.time() + wait_seconds
+        while issued and time.time() < deadline:
+            with self._credit_account_lock:
+                if self._credit_account_stamp > stamp_before:
+                    break
+                if not self._credit_account_inflight:
+                    break
+            # sleep 让出 GIL —— 但如果回调本来就要走这条线程，让出 GIL 也没用，
+            # 见 CREDIT_ACCOUNT_DEFAULT_WAIT_SECONDS 上面的说明。
+            time.sleep(0.02)
+        waited = round(time.time() - (deadline - wait_seconds), 3)
+        with self._credit_account_lock:
+            # 等不到就把 inflight 放掉。原来只有「回调到达」和「func 抛异常」
+            # 两条路会清它 —— 超时路径没人清，于是**一次回调丢失就把这条通道
+            # 永久卡死**：之后每次调用都撞 "a query is already in flight"，再也
+            # 发不出去。放掉的代价只是可能重复问一次柜台，而 30s 最小间隔还在。
+            timed_out = (self._credit_account_inflight
+                         and not (self._credit_account_stamp > stamp_before))
+            if timed_out:
+                self._credit_account_inflight = False
+            rows = list(self._credit_account_rows)
+            stamp = self._credit_account_stamp
+            error = self._credit_account_error
+            seq = self._credit_account_seq
+            callbacks = self._credit_account_callbacks
+        # 太陈的数据宁可不给。给出去而不被察觉，比给不出更坏。
+        age = round(time.time() - stamp, 3) if stamp else None
+        dropped_stale = False
+        stale_reason = ""
+        if rows and max_age_seconds > 0 and age is not None and age > max_age_seconds:
+            dropped_stale = True
+            stale_reason = (
+                "缓存已 %.1f 秒未更新，超过 max_age_seconds=%.0f，不再交出 —— "
+                "这条通道的缓存不会自己刷新。查询已发出，稍后再调一次即可拿到"
+                "新的；要实时数据请用 query_credit_detail。" % (age, max_age_seconds))
+            rows = []
+        return {
+            "rows": rows,
+            "count": len(rows),
+            "query_issued": issued,
+            "not_issued_reason": "" if issued else reason,
+            "fresh": bool(stamp and stamp > stamp_before),
+            "stale": bool(rows and not (stamp and stamp > stamp_before)),
+            "age_seconds": age,
+            "max_age_seconds": max_age_seconds,
+            # 有数据但太陈，已经扣下不给 —— 必须说出来，否则和「没数据」没区别
+            "dropped_stale": dropped_stale,
+            "dropped_stale_reason": stale_reason,
+            "seq": seq,
+            "error": error,
+            "callback_bound": callable(self.qmt_api.get("query_credit_account")),
+            # 这两个才是能定位问题的：callbacks_seen=0 说明 QMT 压根没回调
+            # （等太短？账户不支持？回调没挂上？），>0 说明回调通了、问题在别处。
+            "callbacks_seen": callbacks,
+            "waited_seconds": waited,
+            # 回调实际落在哪条线程上。这一条能证伪上面那个「回调走主线程、
+            # 被我的等待堵住」的假设 —— 不用再猜。
+            "callback_thread": self._credit_account_callback_thread,
+            # 这次是不是等超时并把 inflight 放掉了
+            "inflight_released": bool(timed_out),
+            # 请求要等、但我们已经知道等不到，得说出来，别让人以为等过了
+            "wait_skipped_same_thread": bool(wait_pointless),
+            "note": ("回调投递在本线程（%s）上，等待永远等不到 —— 已跳过等待。"
+                     "查询已发出，结果随后落进缓存，下一次调用即可取到"
+                     % known_callback_thread) if wait_pointless else
+                    ("默认不等回调：查询已发出，结果随后落进缓存，下一次调用即可"
+                     "取到（handler 跑在 adjust 主线程上，等待可能把回调堵在门外）"
+                     if wait_seconds == 0 else ""),
+        }
+
+    def _describe_probe_rows(self, rows):
+        """行数不等于有数据 —— 这条探测自己踩过这个坑。
+
+        QMT 的交易类查询跑在主策略线程之外时，返回的不是空列表，而是**行数
+        对、字段全空**的对象（本机实测：把 get_asset 移出 defer 名单，它照样
+        返回 5 个键，但 cash / total_asset / frozen_cash / market_value 全是
+        None）。原来这里只报 len(rows)，于是在一份真两融账户的报告里给出了
+        `ok: true, rows: 71002`，而同一次运行里走 handler 的同一个函数是 0 行
+        —— 探测反过来把人带偏了（#204）。
+
+        所以这里过一遍 handler 用的同一个归一化，再看**字段里到底有没有东西**。
+        CLAUDE.md 那句「Verify the meaning, not the shape」，说的就是这个。
+        """
+        report = {"rows": len(rows)}
+        try:
+            normalized = _normalize_detail_rows(rows)
+        except Exception as exc:
+            report["normalize_error"] = "%s: %s" % (exc.__class__.__name__, exc)
+            return report
+        report["normalized_rows"] = len(normalized)
+        first = normalized[0] if normalized else None
+        if not isinstance(first, dict):
+            return report
+        report["fields"] = len(first)
+        # None / "" 才算「没拿到」。0 是合法值（没有负债就是 0），不能当空看。
+        present = [key for key, value in first.items()
+                   if value is not None and value != ""]
+        report["populated_fields"] = len(present)
+        # first 必须真的有字段。零字段是「没数据」，不是「空行」—— 判错的话
+        # 一个返回 {} 的接口会被报成跑错线程（本机实跑第一次就误报了）。
+        if first and not present:
+            # 行在、字段全空 —— 这就是跑错线程的签名，必须说出来，不能让
+            # 一个 rows=71002 看着像成功。
+            report["hollow"] = True
+            report["note"] = ("行数对但字段全空 —— QMT 交易类查询在主策略线程"
+                              "之外就是这个样子，查 thread_routing")
+        return report
+
+    def _probe_thread_routing(self):
+        """哪些方法跑在后台 listener 线程上，哪些被推回 adjust 主线程。
+
+        QMT 的交易类查询在主策略线程之外返回空 —— 这是本项目最重要的一条约束，
+        也是 #204 的症结：同一个 QMT 函数，走 adjust 线程有 71002 行，走 listener
+        线程 0 行。而远端报告里看不到路由配置，只能靠猜。这一项把它摊开。
+
+        `sample` 里给的是几个有代表性的方法，不是全集：全集有一百多个，塞进
+        报告没人看得完。
+        """
+        service = getattr(self, "rpc_service", None)
+        if service is None:
+            return {"available": False,
+                    "note": "handlers has no rpc_service backref"}
+        report = {
+            "available": True,
+            "process_in_listener": bool(getattr(service, "process_in_listener", False)),
+        }
+        listener_methods = getattr(service, "listener_methods", None)
+        if listener_methods is not None:
+            try:
+                report["listener_method_count"] = len(listener_methods)
+            except Exception:
+                pass
+        decide = getattr(service, "_should_process_in_listener", None)
+        if callable(decide):
+            sample = {}
+            for name in ("ping", "get_ticks", "get_market_data_ex",
+                         "query_credit_detail", "query_stk_compacts",
+                         "query_credit_subjects", "get_unclosed_compacts",
+                         "get_assure_contract", "get_enable_short_contract",
+                         "get_ipo_data", "get_new_purchase_limit",
+                         "probe_capabilities", "get_asset", "get_positions"):
+                try:
+                    sample[name] = ("listener_thread" if decide({"method": name})
+                                    else "adjust_thread")
+                except Exception as exc:
+                    sample[name] = "unknown: %s" % exc.__class__.__name__
+            report["sample"] = sample
+        return report
+
+    def _probe_credit_account_object(self):
+        """Read-only probe of the credit account object behind query_credit_detail.
+
+        Reports the row count and, when there is a row, m_nBrokerType (3 =
+        信用) plus whether the credit-only fields came through -- so an empty
+        answer can be told apart from a non-credit account, which the bare
+        [] the reporter saw could not (#201).
+        """
+        # getattr 而不是属性直取：不是每种 gateway 都有这个属性（dry-run 的就
+        # 没有），而 probe_capabilities 是诊断接口，它自己崩掉是最坏的结果。
+        gateway = self.order_gateway
+        get_detail = getattr(gateway, "get_trade_detail_data", None)
+        if gateway is None or not callable(get_detail):
+            return {"available": False}
+        try:
+            raw = get_detail(self.account_id, "CREDIT", "ACCOUNT", "") or []
+        except Exception as exc:
+            return {"available": True, "ok": False,
+                    "error": "%s: %s" % (exc.__class__.__name__, exc)}
+        report = {"available": True, "ok": True}
+        report.update(self._describe_probe_rows(raw))
+        rows = _normalize_detail_rows(raw) or []
+        if rows and isinstance(rows[0], dict):
+            report["broker_type"] = rows[0].get("m_nBrokerType")
+            # 键在不等于值在。跑错线程时字段名一个不少、值全是 None，用
+            # `key in row` 判断会报 has_credit_fields=True，而调用方拿到的
+            # 是一行 null —— 和 rows=71002 那个误导是同一个错误（#204）。
+            report["has_credit_fields"] = any(
+                rows[0].get(key) is not None for key in
+                ("m_dPerAssurescaleValue", "m_dFinMaxQuota", "m_dSloMaxQuota"))
+        return report
 
     def _probe_reply_residency(self):
         """How long finished replies wait for the transport to send them.
@@ -1259,6 +1653,50 @@ class BigQmtRpcHandlers:
     # 无该权限/函数未注入时降级为空列表。
     # ------------------------------------------------------------------
 
+    def _warn_if_hollow(self, source, rows):
+        """交易类响应「行数对、字段全空」时大声报出来，别让它静默过去。
+
+        QMT 的交易类查询跑在主策略线程之外时，返回的不是空列表，而是行数对、
+        字段全是 None 的对象（本机实测：get_asset 移出 defer 名单后照样回 5 个
+        键，值全空）。从客户端看像「这个账户没钱」，不像调用失败 —— #204 就是
+        这么在线上静默了几个月。
+
+        静态闸（tests/.../test_trade_context_deferral_guard.py）保证我们**自己**
+        不写漏，但挡不住「换一家券商行为不一样」。所以运行时再看一眼：真出现了
+        就记一条 warning，把函数名和当前线程名一起写出来，让「每家不一样」成为
+        被观测到的事实，而不是我们猜出来的。
+
+        只告警、不改路由：defer 实测只要 2.5-3.0ms，而猜错方向的代价是静默返回
+        错数据，两边完全不对等；而且「跑错线程」和「这个账户真没数据」从返回值
+        上分不开，据此自动切换只会把一次误判固化下来。
+        """
+        if not rows:
+            return rows
+        first = rows[0] if isinstance(rows, (list, tuple)) else rows
+        if not isinstance(first, dict) or not first:
+            return rows
+        if any(value is not None and value != "" for value in first.values()):
+            return rows
+        now = time.time()
+        if now - self._last_hollow_warning_at < HOLLOW_WARNING_INTERVAL_SECONDS:
+            return rows
+        self._last_hollow_warning_at = now
+        try:
+            thread_name = threading.current_thread().name
+        except Exception:
+            thread_name = "?"
+        try:
+            from .logging_setup import get_logger
+            get_logger("rpc").warning(
+                "%s returned %d row(s) with every field empty, on thread %r. "
+                "QMT trade-context queries answer this way off the main strategy "
+                "thread -- the call did NOT fail, the data is simply not there. "
+                "Check probe_capabilities thread_routing (#204).",
+                source, len(rows), thread_name)
+        except Exception:
+            pass
+        return rows
+
     def _call_qmt_global(self, func_name, *args, **kwargs):
         """Call a QMT runtime-injected global function, returning [] on failure.
 
@@ -1271,9 +1709,54 @@ class BigQmtRpcHandlers:
         if func is None:
             return []
         try:
-            return _normalize_detail_rows(func(*args, **kwargs))
+            return self._warn_if_hollow(func_name,
+                                        _normalize_detail_rows(func(*args, **kwargs)))
         except Exception:
             return []
+
+    def _call_qmt_scalar(self, func_name, *args, **kwargs):
+        """Same as _call_qmt_global, for the QMT globals that answer with a
+        plain scalar rather than detail rows -- get_last_order_id returns the
+        委托号 as a str.
+
+        The row normaliser iterates whatever it is handed, so a string goes in
+        and a list of one empty dict PER CHARACTER comes out: the real order id
+        '635005110' became [{}, {}, {}, {}, {}, {}, {}, {}, {}] and '-1'
+        (QMT's "not found") became [{}, {}]. An int raises TypeError inside the
+        normaliser and is swallowed to []. Same shape as #96, where get_ipo_data
+        was destroyed the same way (#207).
+        """
+        func = self.qmt_api.get(func_name)
+        if func is None:
+            return None
+        try:
+            return _normalize_mapping_value(func(*args, **kwargs))
+        except Exception:
+            return None
+
+    def _call_qmt_object(self, func_name, *args, **kwargs):
+        """Same as _call_qmt_global, for the QMT globals that answer with ONE
+        object rather than a list of them -- get_value_by_order_id returns a
+        single 委托/成交 object.
+
+        Handing that straight to the row normaliser iterates the object itself,
+        which raises TypeError and gets swallowed to [] -- the call looks like
+        "no such order" when it actually worked (#207).
+        """
+        func = self.qmt_api.get(func_name)
+        if func is None:
+            return {}
+        try:
+            value = func(*args, **kwargs)
+        except Exception:
+            return {}
+        if value is None:
+            return {}
+        if isinstance(value, (list, tuple)):
+            rows = _normalize_detail_rows(value)
+            return rows[0] if rows else {}
+        rows = _normalize_detail_rows([value])
+        return rows[0] if rows else {}
 
     def _call_qmt_mapping(self, func_name, *args, **kwargs):
         """Same as _call_qmt_global, for the QMT globals that answer with a
@@ -1321,23 +1804,33 @@ class BigQmtRpcHandlers:
             getattr(gateway, "account_type", "CREDIT") or "CREDIT"
         ).strip().upper()
 
-    def _query_trade_detail(self, params, detail_type, strategy_name=""):
+    def _query_trade_detail(self, params, detail_type, strategy_name="",
+                            account_type=None):
         """get_trade_detail_data with one of the 6 official detail types.
 
         Official strDatatype values: ACCOUNT / POSITION / POSITION_STATISTICS /
-        ORDER / DEAL / TASK. Other strings (CREDIT etc.) are NOT supported by
-        this API — use the dedicated functions below for margin queries.
+        ORDER / DEAL / TASK. Other strings are NOT supported as *detail types* —
+        use the dedicated functions below for the margin contract queries.
+
+        *account_type* overrides the deployment's configured type for this one
+        call. That is the ACCOUNT-TYPE axis, not the detail-type axis: the
+        credit account object is `(accId, 'CREDIT', 'ACCOUNT')`, which the
+        caller asks for explicitly regardless of what this deployment trades
+        as (#201).
         """
         account_id = self._request_account_id(params)
         gateway = self.order_gateway
         if gateway is None or gateway.get_trade_detail_data is None:
             return []
-        account_type = (gateway._resolve_account_type(account_id)
-                        if hasattr(gateway, "_resolve_account_type")
-                        else getattr(gateway, "account_type", "STOCK"))
+        if account_type is None:
+            account_type = (gateway._resolve_account_type(account_id)
+                            if hasattr(gateway, "_resolve_account_type")
+                            else getattr(gateway, "account_type", "STOCK"))
         try:
             rows = gateway.get_trade_detail_data(account_id, account_type, detail_type, strategy_name)
-            return _normalize_detail_rows(rows)
+            return self._warn_if_hollow(
+                "get_trade_detail_data(%s,%s)" % (account_type, detail_type),
+                _normalize_detail_rows(rows))
         except Exception:
             return []
 
@@ -1350,8 +1843,17 @@ class BigQmtRpcHandlers:
         return self._query_trade_detail(params, "TASK")
 
     def _handle_query_credit_detail(self, params):
-        # 融资融券账户明细 — 官方独立函数 get_debt_contract
-        return self._call_qmt_global("get_debt_contract", self._request_account_id(params))
+        # 信用（两融）账户明细 — get_trade_detail_data(accId, 'CREDIT', 'ACCOUNT')
+        # 返回 CCreditAccountDetail（维持担保比例 / 融资融券授信额度 / 合约金额…），
+        # 与 MiniQMT query_credit_detail -> XtCreditDetail 对应，也是本仓
+        # docs/MiniQMT_2_BigQMT-Skill/api_mapping.md 一直记着的映射。
+        #
+        # 0.3.23 之前这里调的是 get_debt_contract(accId)：那是「负债合约明细」——
+        # 一张张融资融券合约，不是账户对象，而且官方参考 6.17 已标记【已弃用】
+        # （改用 get_unclosed_compacts / get_closed_compacts）。两融账户查它必然
+        # 拿不到账户信息，没有未了结负债时更是直接空列表（#201）。负债合约本身
+        # 走 query_stk_compacts（get_unclosed_compacts）。
+        return self._query_trade_detail(params, "ACCOUNT", account_type="CREDIT")
 
     def _handle_query_stk_compacts(self, params):
         # 未平仓合约（负债）— 官方 get_unclosed_compacts
@@ -1394,13 +1896,41 @@ class BigQmtRpcHandlers:
 
     # 官方交易查询函数（直接暴露）
     def _handle_get_value_by_order_id(self, params):
+        # 官方签名 get_value_by_order_id(orderId, accountID, strAccountType,
+        # strDatatype)，strDatatype 是 'ORDER' / 'DEAL'（6.11）。原来只传了
+        # orderId 一个参数 —— 少三个，_call_qmt_global 把 TypeError 吞掉返回
+        # 空，从客户端看就是「查不到这笔委托」（#207）。
         order_id = str(params.get("order_id") or params.get("order_sysid") or "")
         if not order_id:
             raise ValueError("order_id is required")
-        return self._call_qmt_global("get_value_by_order_id", order_id)
+        account_id = self._request_account_id(params)
+        detail_type = str(params.get("detail_type")
+                          or params.get("datatype") or "ORDER").strip().upper()
+        # 返回的是单个委托/成交对象，不是行列表 —— 走 _call_qmt_object，
+        # 否则 _normalize_detail_rows 会去迭代这个对象、抛 TypeError 被吞成
+        # []，看起来像「查不到这笔委托」（#207）。
+        return self._call_qmt_object(
+            "get_value_by_order_id", order_id, account_id,
+            self._configured_account_type(account_id), detail_type)
 
     def _handle_get_last_order_id(self, params):
-        return self._call_qmt_global("get_last_order_id", self._request_account_id(params))
+        # 官方签名 get_last_order_id(accountID, strAccountType, strDatatype
+        # [, strategyName])（6.11）。原来只传了 accountID。strategyName 只对
+        # 本地下单有效，用部署的默认策略名，空则不传。
+        account_id = self._request_account_id(params)
+        detail_type = str(params.get("detail_type")
+                          or params.get("datatype") or "ORDER").strip().upper()
+        strategy_name = params.get("strategy_name")
+        if strategy_name is None:
+            strategy_name = self.default_strategy_name
+        strategy_name = str(strategy_name or "")
+        args = [account_id, self._configured_account_type(account_id), detail_type]
+        if strategy_name:
+            args.append(strategy_name)
+        # 返回的是委托号字符串，不是行列表 —— 走 _call_qmt_scalar。实盘实测：
+        # 走 _call_qmt_global 时 '635005110' 被按字符迭代成 9 个空 dict，
+        # QMT 表示「没找到」的 '-1' 变成 2 个空 dict（#207）。
+        return self._call_qmt_scalar("get_last_order_id", *args)
 
     def _handle_get_ipo_data(self, params):
         # get_ipo_data answers with a dict KEYED BY SUBSCRIPTION CODE, not with
@@ -1423,8 +1953,14 @@ class BigQmtRpcHandlers:
         detail_type = str(params.get("detail_type") or params.get("datatype") or "DEAL")
         start_date = str(params.get("start_date") or params.get("start_time") or "")
         end_date = str(params.get("end_date") or params.get("end_time") or "")
+        # 官方签名 get_history_trade_detail_data(accountID, strAccountType,
+        # strDatatype, startDate, endDate)（6.9）。原来漏了 strAccountType，
+        # 于是 detail_type 被塞进了账户类型的位置 —— 少一个参数、还错位，
+        # 和 #96 里 get_ipo_data 把 account_id 当 type 传是同一个形状（#207）。
         result = self._call_qmt_global(
-            "get_history_trade_detail_data", account_id, detail_type, start_date, end_date
+            "get_history_trade_detail_data", account_id,
+            self._configured_account_type(account_id),
+            detail_type, start_date, end_date
         )
         return result
 
@@ -1458,7 +1994,14 @@ class BigQmtRpcHandlers:
         return self._call_qmt_global("get_comb_option", self._request_account_id(params))
 
     def _handle_get_hkt_exchange_rate(self, params):
-        return self._call_qmt_global("get_hkt_exchange_rate")
+        # 官方签名 get_hkt_exchange_rate(accountID, accountType)，accountType 须为
+        # HUGANGTONG / SHENGANGTONG（6.18）。原来一个参数都没传，而 _call_qmt_global
+        # 会把 TypeError 吞掉返回 {} —— 又一次静默返回空，从客户端看和「这台终端
+        # 没有港股通」一模一样（#205）。
+        account_type = str(params.get("account_type")
+                           or params.get("accountType") or "HUGANGTONG").strip().upper()
+        return self._call_qmt_mapping(
+            "get_hkt_exchange_rate", self._request_account_id(params), account_type)
 
     def _handle_download_history_data(self, params):
         """download_history_data is a QMT global function (issue #32).
@@ -2299,6 +2842,12 @@ def _normalize_detail_rows(rows):
         for name in dir(row):
             if name.startswith("_"):
                 continue
+            # QMT 的委托对象上除了 60 个 m_* 字段，还挂着 60 个枚举常量，
+            # 名字是 '0' / '-1' / '101' 这种数字串（值就是常量本身）。dir()
+            # 一并刮进来会让载荷翻倍、还夹着看不懂的键。非标识符的名字一律
+            # 丢掉 —— 真字段（m_xxx / 普通属性名）都是合法标识符，不会误伤。
+            if not name.isidentifier():
+                continue
             try:
                 value = getattr(row, name)
             except Exception:
@@ -2427,6 +2976,13 @@ class RedisPubSubRpcService:
         # strategy file so a reload picks it up without a restart.
         try:
             self.handlers.rpc_transport = transport
+        except Exception:
+            pass
+        # 同理，让 handlers 能报出「这个方法会跑在哪条线程上」。#204 查了半天
+        # 才发现症结是线程路由，而远端报告里恰恰看不到这个 —— 一个只能远程
+        # 诊断的部署，把决定行为的开关藏起来就等于让人猜。
+        try:
+            self.handlers.rpc_service = self
         except Exception:
             pass
         # Route inbound raw payloads through the service's dispatch (which

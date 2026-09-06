@@ -204,5 +204,9 @@ init = _runtime.init
 handlebar = _runtime.handlebar
 order_callback = _runtime.order_callback
 deal_callback = _runtime.deal_callback
+# Credit-account counter query callback. QMT only calls back into the
+# namespace of the file it mounted, so this has to be re-exported here
+# the same way order_callback / deal_callback are (#202).
+credit_account_callback = _runtime.credit_account_callback
 stop = _runtime.stop
 after_backtest = _runtime.after_backtest

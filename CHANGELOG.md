@@ -3,6 +3,120 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [0.3.24] - 2026-09-06
+
+### 新增
+
+- **两道闸，堵住「交易类查询跑到后台线程上」这一整类 bug**：`get_trade_detail_data` 在主策略线程之外返回空是本项目最重要的一条约束，但 `LISTENER_DEFERRED_METHODS` 一直是**手工维护**的集合，没有任何东西检查「这个 handler 碰了交易上下文，它在不在名单里」。#204 就是这么漏的：`get_ipo_data` 当年因为同样的症状被单独修好并 defer，同批的 9 个孪生方法一个都没跟上，在线上静默了几个月。
+
+  **静态闸**（`tests/bigqmt_signal_trader/test_trade_context_deferral_guard.py`）：用 AST 扫出所有碰交易上下文的 handler（含经私有方法的传递闭包，也认 `self.qmt_api.get(...)` 直接取的写法），挨个检查在不在 defer 名单里。漏一个就红。豁免必须写进 `DELIBERATELY_INLINE` 并说明理由 —— 让「不 defer」成为需要解释的决定而不是忘了。当前三条豁免：`probe_capabilities`（诊断接口，adjust 卡住时更要能答）、`download_history_data` / `download_history_data2`（下载耗时长，defer 会卡住主线程）。对 #204 修复前的代码跑这道闸是红的 —— 它当初就能拦住。
+
+  **运行时告警**：静态闸保证我们自己不写漏，但挡不住「换一家券商行为不一样」。所以交易类响应回来「行数对、字段全空」时记一条 warning，把 QMT 函数名和当前线程名一起写出来，60 秒节流（跑错线程时每次查询都 hollow，不节流会刷爆日志，#139 的教训）。**只告警、不自动改路由**：defer 实测只要 2.5-3.0ms（和 inline 的行情读 3.3ms 同量级），而猜错方向的代价是静默返回错数据，两边完全不对等；何况「跑错线程」和「这个账户真没数据」从返回值上分不开，据此自动切换只会把一次误判固化下来。让「每家不一样」成为被观测到的事实，而不是被猜测后自动应对的。
+
+### 修复
+
+- **陈缓存默认不再交出（`max_age_seconds`，默认 120 秒）**：查柜台这条通道的缓存**从不自己刷新** —— 没人调就永远不刷，`age_seconds` 可以是 44 秒，也可以是三小时。真正的风险不是「30 秒 vs 0 秒」，而是一个只读 `rows`、不看 `age_seconds` 的调用方，拿几小时前的**维持担保比例**去做决策还毫无察觉；那是强平线，读错方向是真损失。
+
+  现在超过 `max_age_seconds` 的缓存直接不返回 `rows`，并在 `dropped_stale` / `dropped_stale_reason` 里说清楚为什么、以及该去用什么。年龄仍如实报出 —— 「扣下了」和「从没有过数据」是两回事，不能混。传 `max_age_seconds=0` 显式放弃这层保护。
+
+  **要实时的维持担保比例 / 可用额度，请用 `query_credit_detail`**（同步、读终端本地缓存、无陈旧问题）。查柜台那条是对账用的，官方本来就给了 30 秒最小间隔和「不可频繁调用」，从设计上就不是实时数据源 —— 所以没有做成「真新鲜」，那样最好也只是 30 秒新鲜，却要为一个备用接口持续打柜台。
+
+- **回调线程实测确认：投递在 `MainThread` 上，等待永远等不到**（#202 收尾）：一位有两融账户的用户跑报告回报，`callback_thread: "MainThread"`、`callbacks_seen: 5`、`cached_rows: 1` —— 回调是通的，数据也落进来了，但 `waited_seconds: 8.02` 那一次仍然 `fresh: false`。handler 也跑在 `MainThread`，**等待期间正占着回调唯一能送达的那条线程**，那几次回调全是在两次调用之间落下的。上一条的假设由此坐实。
+
+  据此收尾两处：桥一旦观测到「回调线程 == 当前线程」就**跳过等待**（信封报 `wait_skipped_same_thread`，并说明原因），不再白占 adjust 主线程；体检报告的默认等待改回 **0**（此前从 3 秒提到 8 秒，是在还不知道原因时做的，等于每跑一次报告就把主线程按住 8 秒且必然等不到）。回调若落在别的线程上，显式 `wait_seconds` 仍然照常等 —— 没见过回调时也不做假设。
+
+- **`query_credit_account` 的等待反而堵死了回调，且一次回调丢失就把通道永久卡死**（#202 后续，两个真 bug）：入口捕获修好后，真两融账户上仍然 `query_issued: true`、等满 8 秒、拿不到数据，而同一台机器在大 QMT 里直接调回调是能触发的。
+
+  **其一：等待可能堵住回调本身。** handler 跑在 adjust 主线程上（必须如此，否则拿不到交易上下文），原来它在**同一条线程上** sleep 轮询等回调。QMT 若把 `credit_account_callback` 投递到主线程（`order_callback` 走 C++ 线程，不能照搬），那就是用等待堵住了唯一能送达的路。默认改成**不等**：发出去即返回，回调随后落进缓存，下一次调用取到。这在两种假设下都安全；想等的人显式传 `wait_seconds`。实测默认调用从「等满 8 秒」变成 104ms 返回。
+
+  **其二：`_credit_account_inflight` 只在「回调到达」和「func 抛异常」两处被清，超时路径没人清** —— 回调丢一次，之后每次调用都撞 `a query is already in flight`，**这条通道永久失效**。现在超时释放（信封报 `inflight_released`），外加兜底：卡住超过一个最小间隔就当它丢了。
+
+  同时把「回调落在哪条线程上」记下来（`callback_thread` / `last_callback_thread`）—— 这是个事实问题，记下来就不用继续猜。
+
+- **信用账户回调的成功与失败都不出声，「QMT 没回调」和「回调来了没送到」分不开**（#202 后续）：入口捕获修好后，实盘上出现 `callback_bound: true`、`query_issued: true`，但 `fresh: false` 没数据。而 `credit_account_callback` 无论成功还是失败都静默返回 —— 又是「a failed operation looks exactly like one that never ran」，这次栽在自己的新代码上。
+
+  现在每次回调都留痕：handlers 记 `callbacks_seen` 计数；转交不成功时（没有 RPC service、handlers 太旧没有 `note_credit_account`）**大声报出来**而不是默默 `return False`；归一化失败也照样计数 —— 回调来过就是来过，不能算成「没回调」。`query_credit_account` 的信封新增 `callbacks_seen` 和 `waited_seconds`，`probe_capabilities` 新增 `credit_callback` 一段（不发查询也能看）。体检报告把这两种成因分开写进结论，并把默认等待从 3 秒放宽到 8 秒（查柜台可能更慢，而这是只读查询，等久一点没有代价）。
+
+- **入口文件手抄的 QMT 全局函数名单漏了 `query_credit_account`，桥拿不到它，却被误报成「这台终端没有这个函数」**（#202 后续）：QMT 只往**被挂载的那个文件**的命名空间注入全局函数，所以捕获必须在入口文件里做。策略模块的 `_QMT_INJECTED_GLOBAL_FUNCS` 是这份名单的唯一来源，它自己的注释就写着「do not hand-copy the names elsewhere」—— 而 `BIGQMT_REDIS_DRYRUN.py` 里偏偏有一张手抄表。给策略模块加 `query_credit_account` 时漏了它，于是桥捕获不到 → `probe_capabilities` 报 `callback_bound=false` → 报告据此下结论「这台终端没有 query_credit_account，重启也没用」。
+
+  **而用户在大 QMT 里直接调它是好用的**（维持担保比例 3.35、总负债 1038962.07）。一个桥的 bug 被报成了券商终端的能力缺失 —— 这比返回空更糟，它给出的是一个错误但听起来很确定的结论，会让人不去查真正的地方。
+
+  修法不是再补一个名字，是**别再手抄**：两个被挂载的入口都改成 `capture_qmt_injected_funcs(globals())` 读唯一来源，并加一道闸（`tests/bigqmt_signal_trader/test_no_hand_copied_global_lists.py`）禁止入口文件再出现手抄名单。实盘验证：重启后 `global_namespace` 和 `callback_bound` 都变成 `true`、查询发得出去。**入口文件 `reload_deployment()` 刷不了，这条改动必须真重启策略。**
+
+  同时把三处基于那个错判写下的结论都改了（体检报告的结论文案、`docs/RPC_API_REFERENCE.md`、本文件上一条）：`global_namespace` 为 `False` 只说明「这条解析路径上没有」，**不能**据此断言终端没有这个函数；正确的判断方法是在大 QMT 策略里直接调一次。
+
+- **三个 QMT 全局函数的参数写错，外加两个返回形状用错，全部静默返回空**（#207）：QMT 全局函数的映射是纯手写的，没有任何东西校验它和官方签名对不对。用 AST 把所有调用点扫出来和官方参考比对，查出：`get_value_by_order_id` 只传了 1 个参数（签名要 4 个）、`get_last_order_id` 只传了 1 个（要 3-4 个）、`get_history_trade_detail_data` 传了 4 个且把 `detail_type` 塞到了 `strAccountType` 的位置（要 5 个，和 #96 同一个形状）。全部被 `_call_qmt_global` 的 `except: return []` 吞掉。
+
+  参数修好后实盘一跑，又暴露出返回形状也用错了：`get_last_order_id` 返回的是**委托号字符串**，不是行列表，`_normalize_detail_rows` 会去迭代它 —— 真委托号 `'635005110'` 变成 **9 个空 dict**（一个字符一个），QMT 表示「没找到」的 `'-1'` 变成 2 个空 dict，int 直接抛 TypeError 被吞成 `[]`。**委托号被完全销毁**，而这个函数正是官方「下单 → 查单 → 撤单」标准流程的第二步。`get_value_by_order_id` 同理，它返回**单个**委托对象不是列表，迭代它抛异常同样被吞成 `[]`，看起来像「查不到这笔委托」。新增 `_call_qmt_scalar`（保留标量原样）和 `_call_qmt_object`（单对象归一化）两条取数路径。
+
+  顺带：`_normalize_detail_rows` 丢掉非标识符的属性名。QMT 委托对象上除了 60 个 `m_*` 字段还挂着 60 个数字串名的枚举常量（`'0': 48` / `'-1': -1`），`dir()` 一并刮走让载荷翻倍。实盘实测 120 字段 → 65 字段，真字段一个不少。
+
+  **同时加了一道机械闸**：`tests/bigqmt_signal_trader/test_qmt_global_arity.py` 用 AST 扫出所有 `_call_qmt_*` 调用点，和一张按官方参考手抄的签名表比对，写错参数个数从此是「测试红」而不是「线上静默返回空」；新接一个全局函数不登记签名也会红，防止这道闸慢慢失效。这一个 session 里同形态的 bug 出现了六次（#96 / #201 / #205 / #207 三条），值得一道闸。
+
+  实盘验证（只读）：`get_last_order_id` 从 `[{}, {}]` 变成 `'-1'`；`get_value_by_order_id(635005110)` 从 `[]` 变成 65 个字段的委托对象，`m_strOrderSysID=635005110`、`m_nOrderStatus=56`。`get_history_trade_detail_data` 在本机终端未绑定，未验证。
+
+- **直连的两融 `get_*` 查询恒返回空，而调同一个 QMT 函数的 `query_*` 孪生方法有数据**：一位有两融账户的用户跑 `tools/credit_api_report.py` 回报，同一次运行里 `query_stk_compacts` 52 行 / `query_credit_subjects` 71002 行 / `query_credit_slo_code` 50 行，而 `get_unclosed_compacts` / `get_assure_contract` / `get_enable_short_contract` 全是 0 行。两边的 handler **逐字节相同**，账号相同，底层 QMT 函数也是同一个 —— 唯一的差别是 `query_*` 在 `LISTENER_DEFERRED_METHODS` 里（走 adjust 主线程），直连的不在（走后台 listener 线程）。
+
+  这正是 `get_ipo_data` 早就踩过并修掉的坑，它的注释原文就是「交易类查询, 需主线程上下文（后台线程返回空）」—— 当时只修了它一个，孪生方法漏网。现在把所有要交易上下文的 QMT 全局函数补进 defer 名单：`get_assure_contract` / `get_enable_short_contract` / `get_unclosed_compacts` / `get_closed_compacts` / `get_debt_contract` / `get_option_subject_position` / `get_comb_option` / `get_new_purchase_limit` / `get_hkt_exchange_rate`。行情读（`get_ticks` / `get_market_data*` / `get_option_list` / `get_main_contract` …）保持 inline 不动，defer 会白搭上一个 adjust 间隔的延迟；用例同时钉住这两侧。
+
+  **机制已在本机复现**（不再是推断）：把 `get_asset` 临时移出 defer 名单，同一次运行里它跑到 `listener_thread`，返回的 `cash` / `total_asset` / `frozen_cash` / `market_value` **全是 `None`**，而对照的 `get_positions` 仍在 `adjust_thread`、数据完整。恢复后 `get_asset` 立刻回到 `adjust_thread` 并给出真实值。同一账号、同一传输，唯一变量是线程。
+
+  这同时解释了先前那个「解释不了的反例」：`probe_capabilities` 跑在 listener 线程上却报出 `rows: 71002`，是因为**它只数了行数没看内容** —— 那 71002 行的字段值全是空的。探测自己踩了 `CLAUDE.md` 里「Verify the meaning, not the shape」这一条。
+
+  实测延迟：新 defer 的四个方法 2.5–3.0ms，和本来就 defer 的持平；`get_ticks` 3.3ms、`ping` 12.4ms，行情读没有被拖慢。
+
+- **`probe_capabilities` 和体检报告都把「空行」当成了「有数据」**：行数不等于有数据。QMT 交易类查询跑错线程时返回的是**行数对、字段全空**的对象，而两边都只看行数 —— 于是一份真两融账户的报告里出现了 `get_assure_contract: ok true, rows 71002`，同一次运行走 handler 的同一个函数却是 0 行，探测反过来在误导排查。现在两边都过一遍 handler 用的同一个归一化，再看字段里到底有没有东西：探测报 `populated_fields` / `hollow`，报告把这种情况判成「有行但字段全空」并在结论里点名。`0` 仍算真值（没有负债就是 0），只有 `None` / `""` 才算没拿到。`has_credit_fields` 原来用 `key in row` 判断，跑错线程时字段名一个不少，照样报 `True` —— 改成看值。
+
+- **`get_hkt_exchange_rate` 一个参数都没传**：官方签名是 `get_hkt_exchange_rate(accountID, accountType)`（6.18，`accountType` 须为 `HUGANGTONG` / `SHENGANGTONG`），handler 调的是零参数版本。`_call_qmt_global` 会把 `TypeError` 吞掉返回 `{}`，从客户端看和「这台终端没有港股通」一模一样。现在按签名传参，`account_type` 可用参数覆盖（默认 `HUGANGTONG`），并改走 `_call_qmt_mapping` —— 它返回的是 dict（买卖参考汇率），过 `_normalize_detail_rows` 会把值全丢掉，和 #96 的 `get_ipo_data` 同一个形状。
+
+- **两融账户调 `query_credit_detail` 恒为空列表**（#201）：handler 把它路由到了 `get_debt_contract`。两处都不对 —— 那是「负债合约明细」（一张张合约），不是信用账户对象；而且官方参考 6.17 已把它标记【已弃用】。于是没有未了结负债的两融账户必然拿到 `[]`，有负债的也只拿到合约行，永远拿不到维持担保比例 / 授信额度那一组字段。
+
+  改走 `get_trade_detail_data(accId, 'CREDIT', 'ACCOUNT')` → `CCreditAccountDetail`（官方参考 3.14），也就是本仓 `docs/MiniQMT_2_BigQMT-Skill/api_mapping.md:83` 一直记着、而代码一直没对上的那条映射。账户类型强制 `CREDIT`，不跟部署配置走：账户类型是「问哪本账」，不是「这台部署下单用哪本账」，否则按 `STOCK` 配置的部署永远查不到自己的信用账户。
+
+  顺带修了 `probe_capabilities` 自己的一个坑：它统一用单参数调那四个信用全局函数，而 `get_unclosed_compacts` / `get_closed_compacts` 是两参数签名 `(accountID, accountType)`，实盘上撞 boost::python 的 `ArgumentError` —— **把一个好用的接口报成坏的**，排查时反而在误导人。另外新增 `get_trade_detail_data(CREDIT,ACCOUNT)` 探测项，报 `m_nBrokerType`（3=信用）和信用专有字段是否到位：空列表有「这本账户不是信用账户」和「这台终端读不到」两种成因，原来的裸 `[]` 分不开。
+
+### 新增
+
+- **信用账户「查柜台」通道 `query_credit_account`（备用，一般用不上）**（#202）：大 QMT 里信用账户明细有两个来源。上面 #201 修好的同步那条读终端缓存（`CCreditAccountDetail`，官方参考 3.14），**这是默认路径，维护者实测可用**：`get_trade_detail_data('<信用账号>', 'credit', 'account', '')` 直接取得到，返回 list 取 `[0]`，大小写不敏感。
+
+  异步那条 `query_credit_account(accId, seq, ContextInfo)` 查柜台，结果只从 `credit_account_callback` 出来，本桥此前完全没接过这个回调。现在接上，但**定位是备用**：3.14 那份官方标注「非查柜台」，是终端本地缓存，万一换一家券商的终端不填它，那就只剩查柜台这一条路 —— 而这正是维护者这边验证不了的一类问题。不需要的话完全不用理会，不调它就什么都不会发生。
+
+  两条路互不依赖：`query_credit_detail` 不会在空的时候偷偷退到 `query_credit_account`，也不共享状态。返回对象也不同，**总负债在缓存那份叫 `m_dTotalDebit`、柜台那份叫 `m_dTotalDebt`**，融资/融券负债细分只有柜台那份有，不能混着读。名字容易误导：`query_credit_account` 不是 `query_credit_detail` 的异步版本，两个名字来自两套命名体系（前者是大 QMT 原生全局函数名，后者是 MiniQMT 客户端 API 名）。
+
+  实现要点：`credit_account_callback` 在策略模块定义、每个入口文件再导出一次（QMT 只往被挂载的那个文件回调，同 `order_callback`；两个单文件构建器各自硬编码的清单也补上了，并有用例钉住不许漏）。官方参考 6.13 的限流（「只能有一个查询」「建议 30s 一次」）由桥自己挡，客户端怎么轮询都打不爆柜台；等不到回调就返回上一次的值并标 `stale=true`，不把陈数据冒充新的。响应里 `query_issued` / `fresh` / `callback_bound` / `not_issued_reason` 把「空」的几种成因分开报。
+
+  **入口文件 `reload_deployment()` 刷不了，这条需要真的重启策略**；没重启时 `callback_bound=false`，不影响同步那条。
+
+- **两融 API 只读体检报告 `tools/credit_api_report.py`**：把每个两融接口真调一遍，记下大 QMT 实际返回了什么（行数、字段名、字段有没有值），导出 `.txt` + `.json` 报告。**不下单、不撤单**（用例钉住了清单里不含任何写方法）。默认脱敏，报告可以直接贴到公开 issue：账号打码、金额只记「有值 / 全 0」、`get_positions` 的键是股票代码所以整组打掉；`m_nBrokerType` 例外，保留原值 —— 打了码就没法判断是不是信用账户了。报告带对照组（非两融接口），先回答「是桥不通还是两融接口的问题」，再下结论。
+
+  维护者没有两融账户，两融那一整片只能靠有两融账户的用户跑一次回报 —— 这个工具就是为了把「盲猜」换成「照着报告看」。
+
+### 已知限制
+
+- **#201 的取数路径经维护者实测确认**：`get_trade_detail_data('<信用账号>', 'credit', 'account', '')` 在大 QMT 里能取到信用账户信息。但**这个仓的 RPC 链路本身没有在真实两融账户上跑过** —— 维护者的部署账户是普通股票账户（`m_nBrokerType=2`），信用账本不存在，所有两融接口返回空都是正确行为，证明不了这条链路端到端通。
+
+- **#202 的异步通道曾被误判为「终端不支持」，实为桥自己的 bug**（已修，见下条「入口文件手抄名单」）。修好并重启后 `callback_bound` 变成 `true`、查询发得出去；但维护者的账户是普通股票账户（`m_nBrokerType=2`），柜台不回调，所以**回调链路本身仍未验证**。`probe_capabilities` 的 `global_namespace["query_credit_account"]` 只说明「这条解析路径上有没有」，**不能**据此断言终端有没有这个函数 —— 原来的结论文案就是这么错的，已改成把两种可能都列出来并建议先在大 QMT 里直接调一次确认。
+
+- 已验证的部分：全量测试 1631 passed（收集数 == 文件数）、#201 用例修复前 4 red / 修复后 green、实盘上 `probe_capabilities` 的 `ArgumentError` 已消失、新增探测项能答、体检工具端到端跑通并正确判定「这不是信用账户」、两个单文件构建器重新生成后都带上了回调且 no-redis 那份仍 GBK 可解析。
+
+- **欢迎有两融账户的用户跑 `tools/credit_api_report.py` 并把报告贴到 #201 / #202。**
+
+## [0.3.23] - 2026-09-06
+
+### 修复
+
+- **无 redis / 纯 zmq 部署此前跑的是旧 transport**：`bigqmt_no_redis/zmq_transport.py` 是手工维护的自包含分支（内联了 redis 依赖、去掉服务发现，好在拒绝 `import redis` 的 QMT 沙箱里加载），**没有生成脚本，所以从 7 月 29 日起悄悄漂了** —— 源码 transport 后来拿到 #177（回复入队即唤醒 router，交易查询 1500→605ms）和 #186（每线程一个 DEALER，多线程并发不再排队），这个分支一个都没跟上。而单文件构建器正是**用这个分支覆盖**源码 transport，所以最需要低延迟的纯 zmq 部署，恰恰在跑最旧的那份。
+
+  已从当前源码重新生成（同样的去 redis 变换），现在带上 #177、#186、卡顿看门狗和 reply-residency 统计。验证：断掉 redis 也能独立导入、无 redis 命名的 import 残留、no-redis 单文件构建内联了新代码并编译通过。
+
+  **影响范围**：`bigqmt_no_redis/` 不在 PyPI 包里（只打 `bigqmt_signal_trader*` / `bigqmt_backtest*` / `xtquant*`），所以 pip 安装的客户端不受此条影响；受影响的是用无 redis 单文件构建、或直接部署 `bigqmt_no_redis/` 目录的人。
+
+### 文档
+
+- **Windows 用户怎么拿到 Redis 服务**（#200）：依赖表里的 `redis` 是 redis-py **包**不是 Redis **服务**，全仓库此前没写过服务端 Redis 在 Windows 上怎么来。README「环境要求与依赖安装」新增 C 节：redis-windows 社区发行版地址（免 WSL）、最小 `redis.conf`、对应的 `BIGQMT_REDIS_CONFIG` 填法。**安全提示写在同一段**（不挪后面）：RPC 层无鉴权、队列名 `bigqmt:rpc:queue:<账号>` 含账号不算秘密、`rpc_allow_order_methods=True` 会暴露下单撤单，所以 `requirepass` + `bind 127.0.0.1` 是底线。只写文档、不分发第三方二进制。
+
+- **赞赏码**：README 讨论组一节后加了自愿赞赏的微信码，不影响任何功能。
+
 ## [0.3.22] - 2026-09-05
 
 ### 新增

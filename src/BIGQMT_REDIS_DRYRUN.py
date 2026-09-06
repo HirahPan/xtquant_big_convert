@@ -332,17 +332,19 @@ except Exception as account_config_error:
         _runtime.configure_runtime_account(account_id)
 
 try:
-    qmt_extra = {}
-    for function_name in (
-        "get_history_trade_detail_data", "get_value_by_order_id", "get_last_order_id",
-        "get_ipo_data", "get_new_purchase_limit", "get_assure_contract",
-        "get_enable_short_contract", "get_unclosed_compacts", "get_closed_compacts",
-        "get_debt_contract", "get_option_subject_position", "get_comb_option",
-        "get_hkt_exchange_rate",
-        "download_history_data", "download_history_data2", "down_history_data",
-    ):
-        if function_name in globals():
-            qmt_extra[function_name] = globals()[function_name]
+    # QMT only injects its globals into the namespace of the file it mounts --
+    # THIS one -- so the capture has to happen here, with this file's globals().
+    #
+    # It used to be a hand-copied tuple of names right here, and that is exactly
+    # how query_credit_account went missing: it was added to the strategy
+    # module's _QMT_INJECTED_GLOBAL_FUNCS (which the strategy's own comment
+    # calls "the single source for that list; do not hand-copy the names
+    # elsewhere") and this copy was not updated. The bridge then reported
+    # "this terminal does not have query_credit_account" while the terminal had
+    # it all along -- a bridge bug misreported as a broker capability (#202).
+    #
+    # So: read the single source instead of copying it.
+    qmt_extra = _runtime.capture_qmt_injected_funcs(globals())
     print("[bigqmt_shell] download globals bound=%s" % sorted(k for k in qmt_extra if "download" in k or "down_history" in k))
     _runtime.bind_runtime_api(
         passorder_func=globals().get("passorder"),
@@ -377,3 +379,7 @@ handlebar = _runtime.handlebar
 adjust = _runtime.adjust
 order_callback = _runtime.order_callback
 deal_callback = _runtime.deal_callback
+# Credit-account counter query callback. QMT only calls back into the
+# namespace of the file it mounted, so this has to be re-exported here
+# the same way order_callback / deal_callback are (#202).
+credit_account_callback = _runtime.credit_account_callback

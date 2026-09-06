@@ -329,7 +329,39 @@
 | `get_comb_option` | `account_id`(可选) | 组合期权 |
 | `get_hkt_exchange_rate` | 无 | 港股通汇率 |
 
-> **融资融券查询的正确方式**：官方文档明确 `get_trade_detail_data` 的合法 `strDatatype` 只有 6 个（`ACCOUNT`/`POSITION`/`POSITION_STATISTICS`/`ORDER`/`DEAL`/`TASK`）。两融查询必须用上述独立函数，不要传 `"CREDIT"` 等字符串。
+> **融资融券查询的正确方式**：`get_trade_detail_data(accountID, strAccountType, strDatatype, strategyName)` 有**两个轴**，别混在一起：
+>
+> - **`strDatatype`（查什么数据）** 只有 6 个合法值：`ACCOUNT` / `POSITION` / `POSITION_STATISTICS` / `ORDER` / `DEAL` / `TASK`。**别往这里传 `"CREDIT"`** —— 负债合约、担保标的、可融券这些要用上表的独立函数。
+> - **`strAccountType`（查哪本账）** 才是填 `'CREDIT'` 的地方。官方 `strDatatype` 说明里写着 `ACCOUNT：账号对象**或信用账号对象**` —— 所以信用账户明细就是 `get_trade_detail_data(accId, 'CREDIT', 'ACCOUNT')`，返回 `CCreditAccountDetail`。`query_credit_detail` 走的正是这条（#201 之前它错调了已弃用的 `get_debt_contract`，两融账户因此恒为空）。
+>
+> **信用账户明细有两份，字段名还不一样**：
+>
+> | | RPC | 大 QMT | 对象 | 特点 |
+> |---|---|---|---|---|
+> | **终端缓存（默认用这条）** | `query_credit_detail` | `get_trade_detail_data(accId,'CREDIT','ACCOUNT')` | `CCreditAccountDetail`（3.14，标注「非查柜台」）| 同步、无限流、不用重启 |
+> | 查柜台（备用） | `query_credit_account` | `query_credit_account` + `credit_account_callback` | `CCreditDetail`（3.15）| 异步、权威；官方建议 30s 一次；要重启策略 |
+>
+> **先用同步那条。** 维护者实测确认 `get_trade_detail_data('<信用账号>', 'credit', 'account', '')` 在大 QMT 里直接取得到信用账户信息，返回 list，取 `[0]`；账号类型和数据类型大小写都不敏感（`'credit'` / `'CREDIT'` 均可）。异步那条只是备用：3.14 那份官方标注「非查柜台」，是终端本地缓存，万一换一家券商的终端不填它，那就只剩查柜台这一条路。不需要的话完全不用理会 `query_credit_account`，不调它就什么都不会发生。
+>
+> 总负债在缓存那份叫 `m_dTotalDebit`，在柜台那份叫 `m_dTotalDebt` —— 只差一个字母，别看错。
+
+### `query_credit_account`（备用，一般用不上）
+- **什么时候才需要它**：`query_credit_detail` 在你的终端上取不到时。同步那条是主路径，实测可用；这条是为「终端不填 3.14 那份缓存」的券商准备的后路。
+- **参数**：`account_id`(可选) `wait_seconds`(可选，默认 1.5，上限 10)
+- **返回**：`{"rows": [...], "count": n, "query_issued": bool, "not_issued_reason": str, "fresh": bool, "stale": bool, "age_seconds": float|null, "seq": int, "error": str, "callback_bound": bool}`
+- **为什么不是裸列表**：大 QMT 那边 `query_credit_account(accId, seq, ContextInfo)` 立刻返回，结果只从 `credit_account_callback` 出来。桥替你发查询、等回调、缓存结果，所以这条 RPC 本身是同步的 —— 但**空列表有好几种成因**（没绑上 / 被限流 / 发了没等到回调 / 真没数据），只回一个 `[]` 分不开。看 `query_issued`、`fresh`、`callback_bound`，别只看 `rows`。
+- **限流**：官方参考 6.13 写明「只能有一个查询」「建议 30s 一次，不可频繁调用」。桥按 30 秒最小间隔挡住过密的查询，直接返回上一次的结果并标 `stale=true`，不会替你去打柜台。
+- **`callback_bound=false` 有两种成因，别白重启一次**：
+  - **桥自己没捕获到它。** QMT 只往被挂载的入口文件的命名空间注入全局函数，入口必须用 `capture_qmt_injected_funcs(globals())` 从策略模块的唯一名单里捕获。入口文件曾经手抄过一份名单并漏了 `query_credit_account`，桥于是拿不到它 —— 而终端明明有。**这类情况下 `global_namespace` 也会是 `False`，所以不能据此断言终端没有这个函数**（#202 就是这么误判的）。改入口文件后必须**真重启策略**，`reload_deployment()` 刷不了入口。
+  - **这台终端确实没有这个函数** —— 那就只能走同步那条。
+
+  两者从桥这边分不开。**判断方法：在大 QMT 的策略里直接写一行 `query_credit_account(accId, int(time.time()), ContextInfo)` 配 `credit_account_callback`,能打印出维持担保比例就说明终端有,问题在桥。**
+  - **有这个函数但没重启策略** —— `credit_account_callback` 定义在入口文件命名空间里（QMT 只往被挂载的那个文件回调），而入口文件 `reload_deployment()` 刷不了，必须真重启。
+
+  `probe_capabilities` 的 `global_namespace["query_credit_account"]` 分得开这两种，体检报告也会直接告诉你是哪一种。
+- **客户端**：`xt_trader.query_credit_account(account, wait_seconds=None)`
+
+> **体检工具**：`python tools/credit_api_report.py` 把上面每个两融接口都只读调一遍，导出一份可以直接贴到 issue 的报告（账号打码、金额不带原值、持仓代码不进报告）。维护者没有两融账户，两融那一片只能靠有两融账户的用户跑一次回报。
 
 ---
 

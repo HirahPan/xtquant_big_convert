@@ -40,6 +40,9 @@ if _load_bridge_module is not None:
     bind_qmt_api = _strategy_module.bind_qmt_api
     capture_qmt_injected_funcs = _strategy_module.capture_qmt_injected_funcs
     configure = _strategy_module.configure
+    # 信用账户查柜台的回调；QMT 只往被挂载的文件回调，所以这里必须再导出一次，
+    # 和 order_callback / deal_callback 同理 (#202)。
+    credit_account_callback = _strategy_module.credit_account_callback
     deal_callback = _strategy_module.deal_callback
     handlebar = _strategy_module.handlebar
     init = _strategy_module.init
@@ -53,6 +56,7 @@ else:
         bind_qmt_api,
         capture_qmt_injected_funcs,
         configure,
+        credit_account_callback,
         deal_callback,
         handlebar,
         init,

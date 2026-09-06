@@ -237,16 +237,13 @@ except Exception as account_config_error:
         _runtime.configure_runtime_account(account_id)
 
 try:
-    qmt_extra = {}
-    for function_name in (
-        "get_history_trade_detail_data", "get_value_by_order_id", "get_last_order_id",
-        "get_ipo_data", "get_new_purchase_limit", "get_assure_contract",
-        "get_enable_short_contract", "get_unclosed_compacts", "get_closed_compacts",
-        "get_debt_contract", "get_option_subject_position", "get_comb_option",
-        "get_hkt_exchange_rate", "down_history_data",
-    ):
-        if function_name in globals():
-            qmt_extra[function_name] = globals()[function_name]
+    # QMT only injects its globals into the namespace of the file it mounts --
+    # THIS one -- so the capture has to happen here, with this file's globals().
+    # Read the strategy module's single source instead of hand-copying the
+    # names: a copy here is how query_credit_account went missing on the redis
+    # entry, and the bridge then reported it as "this terminal does not have
+    # that function" when the terminal had it all along (#202).
+    qmt_extra = _runtime.capture_qmt_injected_funcs(globals())
     print("[bigqmt_shell] down_history_data bound=%s" % ("down_history_data" in qmt_extra))
     _runtime.bind_runtime_api(
         passorder_func=globals().get("passorder"),
@@ -263,3 +260,7 @@ handlebar = _runtime.handlebar
 adjust = _runtime.adjust
 order_callback = _runtime.order_callback
 deal_callback = _runtime.deal_callback
+# Credit-account counter query callback. QMT only calls back into the
+# namespace of the file it mounted, so this has to be re-exported here
+# the same way order_callback / deal_callback are (#202).
+credit_account_callback = _runtime.credit_account_callback

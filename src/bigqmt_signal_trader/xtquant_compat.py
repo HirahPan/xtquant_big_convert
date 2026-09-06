@@ -4355,7 +4355,52 @@ class BigQmtXtTrader:
         return self._query_account_list(account, "query_account_status")
 
     def query_credit_detail(self, account):
+        """信用账户明细，读终端缓存的信用账号对象（同步）。
+
+        大 QMT 走 get_trade_detail_data(accId, 'CREDIT', 'ACCOUNT')。这份是
+        「非查柜台」的本地缓存（官方参考 3.14），券商没推就是空的 —— 空列表
+        时用 query_credit_account() 问柜台那一份（#201 / #202）。
+        """
         return self._query_account_list(account, "query_credit_detail")
+
+    def query_credit_account(self, account=None, wait_seconds=None,
+                             max_age_seconds=None):
+        """信用账户明细，查柜台的那一份（官方参考 6.13）。
+
+        大 QMT 那边是异步的：query_credit_account 立刻返回，结果从
+        credit_account_callback 出来。桥这边替你发查询、等回调、缓存结果，
+        所以这个调用本身是同步的。
+
+        **返回的是最近一次柜台答案，不是这一次查询的结果。** 回调实测投递在
+        MainThread 上（handler 也在那条线程），所以这一次的新答案只可能在本次
+        调用返回之后才落进缓存 —— 想要它，隔一会儿再调一次。看 fresh /
+        age_seconds 判断新旧，不要只看 rows（#202）。
+
+        缓存**不会自己刷新**：没人调就永远不刷。所以默认超过 120 秒的数据
+        直接不给（`dropped_stale`），免得有人拿几小时前的维持担保比例去做
+        决策还毫无察觉。传 max_age_seconds=0 显式放弃这层保护。
+
+        **要实时的维持担保比例 / 可用额度，请用 query_credit_detail** ——
+        同步、读终端本地缓存、没有陈旧问题。这条查柜台的路是对账用的。
+
+        Args:
+            wait_seconds: 等回调的秒数。默认 0（不等）—— 回调若与 handler 同在
+                一条线程，等待永远等不到，只会白占 adjust 主线程。
+            max_age_seconds: 缓存超过这个年龄就不返回 rows。默认 120，0 = 不限。
+
+        Returns:
+            dict: rows / count / fresh / stale / age_seconds / max_age_seconds /
+                dropped_stale / dropped_stale_reason / query_issued /
+                not_issued_reason / callbacks_seen / callback_thread / seq /
+                error / callback_bound
+        """
+        account_id = _account_id(account, self.client.account_id)
+        params = {"account_id": account_id}
+        if wait_seconds is not None:
+            params["wait_seconds"] = float(wait_seconds)
+        if max_age_seconds is not None:
+            params["max_age_seconds"] = float(max_age_seconds)
+        return self.client.call("query_credit_account", params, account_id=account_id)
 
     def query_stk_compacts(self, account):
         return self._query_account_list(account, "query_stk_compacts")
