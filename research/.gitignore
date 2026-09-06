@@ -1,0 +1,10 @@
+# Local caches and runtime artifacts are never part of research history.
+data/
+logs/
+**/__pycache__/
+*.py[cod]
+*.db
+*.sqlite*
+*.log
+.venv/
+.pytest_cache/

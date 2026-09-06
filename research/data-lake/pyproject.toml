@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qmt-local-data-lake"
+version = "0.1.0"
+description = "Private local daily-data warehouse for QMT research"
+requires-python = ">=3.8"
+dependencies = [
+    "pandas>=1.5",
+    "pyarrow>=10.0.0",
+    "duckdb>=0.9.0",
+    "akshare>=1.18.0",
+]
+
+[project.scripts]
+qmt-data-lake = "qmt_data_lake.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
