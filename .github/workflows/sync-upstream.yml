@@ -1,0 +1,41 @@
+name: Sync upstream main
+
+on:
+  schedule:
+    # 21:17 Asia/Shanghai (UTC+8), kept off the top of the hour.
+    - cron: "17 13 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out fork main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Fetch and merge upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/litaolemo/xtquant_big_convert.git
+          git fetch upstream main
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "main already includes upstream/main"
+            exit 0
+          fi
+
+          git merge --no-edit --no-ff upstream/main
+          git push origin HEAD:main
