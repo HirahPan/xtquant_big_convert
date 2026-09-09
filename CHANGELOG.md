@@ -3,6 +3,47 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [0.3.30] - 2026-09-09
+
+### 修复
+
+- **`rpc_listener_methods` 写成别名时，账户/持仓查询仍被派发到后台线程**（#252，
+  由 @shengyy 带隔离复现报告）。`_expand_listener_methods` 把调用方写的原始别名
+  和它的 canonical 名一起放进结果，再减掉 `LISTENER_DEFERRED_METHODS` —— 减的是
+  canonical 名，于是 `get_positions` 被拿掉、`query_stock_positions` 原地留下；
+  `_should_process_in_listener` 又是先按原始方法名直接匹配，别名一命中就 inline。
+  `rpc_background_threads=True` 时这条路把 `get_trade_detail_data` 带离主策略线程，
+  它返回的不是异常而是**行数对、字段全 None** 的空壳，客户端读成「这账户没钱」。
+  `("get_positions",)` 和 `("*",)` 两种写法一直是对的（`READ_METHODS` 里只有
+  canonical 名），所以现象看起来像「配置写法不同结果不同」。
+
+  现在减法按 canonical 名做，另外在 `_should_process_in_listener` 里加了第二道闸：
+  展开是构造期的一次性动作，派发是每个请求都走的路径，把不变量钉在派发处，
+  任何没想到的拼法都绕不过去。#244/#248 修的是同一处的显式点名分支，这次是它
+  的别名残留。
+
+- **批量订阅几千只股票会把 QMT 卡死**（#247，由 @shihaibi 报告并提交修复）。
+  `subscribe_whole_quote` 的首帧 prime 用 `get_full_tick(code_list)`，而它在 QMT
+  的 adjust 线程上逐只处理，耗时随列表增长：实测中位 100 只 ~170ms、200 只
+  ~500ms、500 只 ~2.5s、1000 只 ~9.5s，3000 只直接 `TimeoutError` —— 这段时间
+  adjust 线程被占住，drain 停摆，后续所有 RPC 排在后面一起超时。交易所整体
+  token 是稳定的 ~330ms，与列表规模无关，所以超过阈值改走 token 再按原列表过滤。
+  实测 3000 只从超时变成 341ms 拿全 3000 条。
+
+  收尾两处（本仓跟进）：**期货不再静默丢失首帧** —— 实测 `SF`/`DF`/`ZF`/`IF`/
+  `INE`/`GF` 这些期货 token 的整体查询**全部返回 0 条**（只有 `SH`/`SZ`/`BJ` 有
+  数），原实现把后缀一律当 token 用，于是期货列表 prime 出空结果、回调根本不
+  触发，订阅看着是活的而首帧没了（#95 的形状）。现在按交易所是否支持整体快照
+  拆分，不支持的那部分走直连；代码仍**原样**传给 QMT，只有后缀和比较用的副本
+  转大写（大 QMT 有 `cu2610.SF`、没有 `CU2610.SF`，#58/#95）。
+
+  以及 **`subscribe()` 里的 `time.sleep(1)` 换成有界的就绪等待**。竞态是真的：
+  `_start_event_listener` 起 daemon 线程就返回，`pubsub.subscribe()` 之前发布的
+  事件会丢，紧接着下单的调用方可能收不到自己的成交回调。现在监听器真正订阅上
+  之后置位，`subscribe()` 等这个信号、上界仍是 1s（最坏不比原来差），实测正常
+  情况从固定 1000ms 变成 0.0ms。`BIGQMT_EVENT_READY_TIMEOUT=0` 可关闭。
+
+
 ## [0.3.29] - 2026-09-08
 
 三个由 @shengyy 报告的问题，都带隔离复现，逐条核实后修复。
