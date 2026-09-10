@@ -3,7 +3,54 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
-## [未发布]
+## [0.3.33] - 2026-09-10
+
+对齐 MiniQMT 契约：账户查询从 dict 改成可属性访问的行对象（现场报错 `'dict' object has no attribute 'm_nStatus'`），另按终端自带的 `xttype` 逐个对账，补齐七处回调与返回对象缺的字段（#271）。
+
+### 修复
+
+- **账户查询返回 dict，属性访问一律 AttributeError**（`query_account_status` /
+  `query_account_infos` / `query_credit_detail`）。现场报错是
+  `AttributeError: 'dict' object has no attribute 'm_nStatus'`。
+
+  按终端自带的 `xtquant` 核对过：MiniQMT 的**同步**查询把终端自己的对象原样交出
+  去，`common_op_sync_with_seq` 就是 `return future.result()`，全程不转换；整个
+  `xttrader.py` 里只有四处构造 `xttype.*`，都在异步应答和推送的包装里。账号状态
+  唯一那次转换发生在推送路径 `on_push_AccountStatus`，它读 `m_nStatus` 再包成
+  `XtAccountStatus`。所以同步查询本来就该给带 `m_` 属性的对象。
+
+  桥这边名字一直是对的（服务端原样转发终端的 `m_` 键），错的是容器。行改成
+  `CompatRow`，一个既能属性访问又仍然是 `dict` 的子类 —— 今天在用下标
+  `row["m_nStatus"]` 的调用方不受影响，json 编码和 `isinstance(.., dict)` 也照旧。
+
+- **七处回调/返回对象缺 `xttype` 契约里的字段**。#133 定的规矩是「契约声明的字段
+  必须在，缺就给 MiniQMT 语义的默认值，而不是让调用方撞 AttributeError」，当时补
+  的是委托/成交/持仓。拿终端自带的 `xttype` 逐个对账，剩下这些还短着：
+
+  | 交付点 | 缺失字段 |
+  | --- | --- |
+  | `on_order_error`（推送） | `account_type`、`account_id` |
+  | `on_cancel_error`（推送） | `account_type`、`account_id`、`market` |
+  | `query_stock_asset` | `account_type` |
+  | `on_order_error`（异步） | `account_type`、`account_id`、`strategy_name` |
+  | `on_order_stock_async_response` | `account_type` |
+  | `on_cancel_error`（异步） | `account_type`、`account_id`、`market` |
+  | `on_cancel_order_stock_async_response` | `account_type` |
+
+  `account_id` 尤其冤：推送那两处的 `_deliver_event` 在函数开头就把它算好了，只是
+  没往对象里传。资产对象同时补了 `m_nAccountType`，和 PR #67 给持仓/资产加的那套
+  `m_` 别名保持一致。
+
+  `XtCancelError.market` 按代码后缀推（`SH_MARKET` 0 / `SZ_MARKET` 1）。异步撤单
+  那条路径本来就没有代码，给 -1 表示「未知」，而不是让默认值冒充上海 —— `SH_MARKET`
+  正好是 0。
+
+  委托、成交、持仓、以及推送的账号状态四类对象对账下来没有缺口。
+
+
+## [0.3.32] - 2026-09-10
+
+客户端方法补齐与合成周期回落（#262 / #237），另修两处取值 bug：上午五位 HHMMSS 成交时间被解析成 0（#266，由 @shengyy 报告并提交 #267），以及显式传空的 `strategy_name` 被替换成 `bigqmt_rpc`（#268）。
 
 ### 修复
 
@@ -112,6 +159,32 @@
   `_PROBE_CONTEXT_METHODS` 里没有这个名字，probe 永远不报它，报告人和维护者都
   把「两边都没有这个键」读成了「两边一样」，白白多走了两轮。
 
+- **上午五位 HHMMSS 的成交时间被解析成 0**（#266，由 @shengyy 报告并提交修复
+  #267）。QMT 有时把上午的源时间去掉小时位的前导零发出来，`93003` 这样的五位串
+  被 `(time_digits + "000000")[:6]` 右补成 `930030`，成了不存在的 93 点，
+  `strptime` 抛错，`traded_time` 落成 0。成交 ID、数量、价格都正常，只有时间是
+  0，依赖有效源时间的下游因此无法接受这些成交快照。
+
+  五位 HHMMSS 现在在原 parser 里左补小时的 0。`adapters/order_bigqmt.
+  _order_time_seconds` 原本复制了同一段解析，这次删掉、改为委托同一个
+  `date_time_seconds` —— 顺带修好委托路径上「时间字段自带日期」的情况：十四位
+  串以前被截成前六位，`20260910093015` 会被读成 20:26:09（不报错，只是错）。
+
+  维护者的国金 2.1.19.0 实盘终端上做过只读对拍：当天真实成交与委托的时间值
+  新旧解析完全一致，六位值按秒扫遍整个交易日无差异，五位的 9 点档 3600 种取值
+  旧解析全部返回 0、新解析全部正确。需要说明的是，五位这种形状当天没有在该终端
+  自然出现，复现环境是报告人的大 QMT STOCK 测试账户。
+
+- **`strategy_name` 显式传空串时被替换成 `bigqmt_rpc`**（#268）。#154 把 QMT
+  委托列表「报单来源」那一列的字符串交给调用方决定，空串在那里是真实取值：它让
+  这一列留白，跟手工下单的委托一样。配置层的默认值一直正确处理空串，但两个下单
+  入口用 `or` 取值，空串是假值，于是落回 `DEFAULT_ORDER_STRATEGY_NAME`，每笔
+  委托都打上调用方正想去掉的那个字符串。现在只有调用方没给值（`None`）才回落
+  默认。
+
+  批量那处还决定幂等查询用哪个名字去查：留白部署下委托以空名字下出去，查询却
+  按 `bigqmt_rpc` 去找，匹配不到自己下过的单，重试因此识别不出来。
+
 ### 文档
 
 - **`docs/RPC_API_REFERENCE.md` 3.12 有两条标注是错的，按实测订正**：
@@ -144,6 +217,8 @@
 5565745），窗口具体多长没能定死。`get_turn_over_rate` 的数据前提未满足，
 故「stub 本身坏了」这条也只是可能而非结论。以上都只来自一台终端（国金大 QMT
 2.1.19.0），2026-09-09 收盘后实测；`svol` / `bvol` 是盘中量，盘中重测数字会变。
+
+- **赞赏码换新**：`docs/assets/appreciation-qr.png` 换成新生成的浅色版赞赏码。路径没变，README 的引用和说明文字都不用动。
 
 ### 已验证 / 未验证
 

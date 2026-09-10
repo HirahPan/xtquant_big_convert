@@ -30,9 +30,9 @@
 
 如果这个项目帮到了你，欢迎给开发者买杯咖啡（完全自愿，不影响任何功能）：
 
-<img src="docs/assets/appreciation-qr.png" alt="LEMO 的微信赞赏码" width="260">
+[LEMO 的微信赞赏码](https://mp.weixin.qq.com/s/Z9ievBUTG1Tyonv7m_NhIw)
 
-> 微信扫码赞赏。
+> 打开链接，在微信里赞赏。
 
 ---
 
