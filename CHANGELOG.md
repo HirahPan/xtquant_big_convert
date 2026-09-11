@@ -3,6 +3,114 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [0.3.38] - 2026-09-11
+
+文档版。部署快速开始重写：`bigqmt-init` 嵌进流程并写明它不做什么，新增「升级已有部署」一节，按实际跑过两遍的流程写（#285）。代码与 0.3.37 相同。
+
+### 文档
+
+- **部署快速开始重写，`bigqmt-init` 嵌进流程，新增「升级已有部署」一节**。之前快速开始
+  压根没提向导、第 3 步让人手抄配置，README 那段向导说明又没说它在流程里的位置，两份文档
+  互不引用。向导最容易被误解的两点现在写明：`package` 模式下它**只写配置、不拷包**，跑完
+  打印的「把 src/ 同步到 QMT」是对源码检出说的，pip 装的没有 `src/`；「QMT 的 python
+  目录」那一问直接回车会写到当前目录，服务端找不到配置。三种部署方式加了对照表和取舍。
+
+  「升级已有部署」按实际跑过两遍的流程写：先查线上版本；把线上包和 tag 逐文件比对且
+  **先归一化换行符**（Windows 上是 CRLF，git 里是 LF，不归一化会把正常状态误判成大量私改）；
+  三个顶层文件没变才能 `reload_deployment`，变了要重启策略；用 QMT 自带的 `pythonw.exe`
+  编译一遍要变的文件（服务端跑在 3.6.8 里，`pyproject` 声明的 3.8 以上管不到它，且
+  `pythonw` 没有控制台要把结果写进文件）；备份放在 `python` 目录外；清 `__pycache__`。
+  常见问题表补了三条：向导回车写错目录、信用账户选了 STOCK、升级后 `SyntaxError`。
+
+
+## [0.3.37] - 2026-09-11
+
+单票下载耗时超过 1 分钟的根因是下载轮询里的自愈把等待中的那笔下载反复重提交（#275，由 @pujfei 报告并定位机制）。修后同一终端单票 1d 冷宽窗 0.06 秒。
+
+### 修复
+
+- **单票下载耗时超过 1 分钟，而服务端下载本身只要零点几秒**（issue #275，由
+  @pujfei 报告并把机制追到了底）。`download_history_data2` 提交下载后轮询
+  `get_market_data_ex` 等数据落地，这次读经过 `_heal_adjusted`：自愈看到「原始库
+  没就绪」就调 `_ensure_server_raw`，把刚提交的那笔下载**原样再提交一遍**、睡 2 秒、
+  再读。轮询的目的是等落地，自愈的动作却是再排一个同样的任务，等待目标被反复推
+  后，只能打满 60 秒。单票最惨：自愈的多数判据 `missing < max(1, len(codes) // 2)`
+  对一个代码退化成「缺一个就自愈」，那道防全市场读的防线在单票下载下完全失效。
+  服务端对重复提交也没有去重。
+
+  修法是报告人提的最小改动：`get_market_data_ex` 加 `heal` 开关（默认 True，既有
+  行为不变），只有下载轮询里的读传 `heal=False`。下载仍只提交一次，可见性等待照旧
+  （#47 / #66 不动）。报告人修复后实测同一台终端单票 1d 冷宽窗从超过 1 分钟降到
+  0.06 秒；批量之前之所以快，是多码时判据不易触发、绕开了 bug。
+
+  新增测试用「数据晚落地」的假客户端数下载提交次数：不复权和前复权两条分支在修前
+  都提交了 2 次，修后各 1 次；另两条护栏钉住可见性等待仍然发生、直接读仍会自愈。
+
+### 文档
+
+- README 里为 #275 补的那段把 60 秒归因于「冷票大区间的固有等待」，是错的，已按
+  上面的根因改写；「用批量形态」的建议保留，但说明它快是绕开了 bug，不是本来就快。
+
+
+## [0.3.36] - 2026-09-11
+
+三处修复，都有实测依据：合成周期空答案是列字典时 #237 的回落进不去（#279，@yucejade）；`get_sector_list` 兜底清单里 `沪市A股` / `深市A股` 拼错，这台终端认的是 `上证A股` / `深证A股`；委托回报推送从没带过 `price_type`，回调拿到的永远是 None（#280）。
+
+### 修复
+
+- **合成周期回落在国金 2.0.8.0 上自动触发进不去**（issue #237）：`get_market_data_ex_ori` 对 1mon+ 的空答案不是 `[]`，而是 12 个字段、每个都是长度为 0 的列字典（`{time:[], stime:[], open:[], ... settelementPrice:[], ...}`）。`_market_data_answer_empty` 用 `if records:` 判断，这个 dict 为真，主路径被当成「有数」直接返回，`_synth_period_rescue` 根本不跑。同一台终端上 `synth_fallback_only=True` 能救出 10 行（`ContextInfo.get_market_data`），公式口六列也是 10 行。现在列字典看任一列的长度，全 0 才是空。单测假终端原先写 `{code: []}`，覆盖不到这个形状。
+
+- **`get_sector_list` 兜底清单里两个板块名拼错，喂给 `get_stock_list_in_sector` 返回空**。
+  把 13 个名字在国金大 QMT 2.1.19.0 上逐个实测（2026-09-11，只读）：`沪市A股` /
+  `深市A股` 返回 0 行，这台终端的拼法是 `上证A股` / `深证A股`（2318 / 2902 只，
+  合计正好等于 `沪深A股` 的 5220）。基金反过来，`沪市基金` / `深市基金` 有数据而
+  `上证基金` / `深证基金` 为 0，所以拼法没有规律，只能测。清单已改正；`中金所`
+  在股票账户上返回 0，判断是权限而非拼写，保留。
+
+  这正是 #143 担心的事：一份看起来像真的清单里混着答不出东西的名字。新增测试
+  钉住改正后的两个名字、钉住错拼法不会回流、钉住基金拼法不被「顺手修坏」。
+
+- **委托回报推送上 `price_type` 恒为 None**。查询路径 `query_orders` 一直读原生
+  `m_nOrderPriceType`，推送路径 `normalize_order_event` 发了 19 个字段却从没读过
+  这一个，走 `on_stock_order` 回调的调用方拿到的 `XtOrder.price_type` 永远是
+  None——现场是同一笔委托，提交日志写着 MARKET，每条回报推送都是 None。
+  `xttype.XtOrder` 契约里有这个字段，所以这和 #271 补的七处、#173 补的
+  `trade_amount` 是同一类缺口：查询和推送两条路径要给出同一组字段。现在推送也读
+  `m_nOrderPriceType`，两边对齐。
+
+### 文档
+
+- README「板块」一节加了 13 个名字的实测对照表，附返回条数；`get_stock_list_in_sector`
+  拼错名字不报错、只给空列表，看到空结果先核对名字。RPC 参考 3.3 节同步改正名字，
+  并把「fallback 返回一组常用板块名」这句改成现在的实际行为：默认抛错，`allow_fallback=True`
+  才给清单。
+
+---
+
+## [0.3.35] - 2026-09-11
+
+### 修复
+
+- **`query_account_status` 实盘恒空列表**（issue #272）：占位实现用了 `TASK` detail type——那是**委托任务状态**，没在跑的委托任务时恒空，和账号状态是两回事。大 QMT 没有原生账号状态结构，最近真源是 ACCOUNT 行的 `m_Enable`：可用 → `ACCOUNT_STATUS_OK(0)`，禁用 → `ACCOUNT_STATUS_FAIL(3)`，无 ACCOUNT 行 → 空列表。MiniQMT 更丰富的状态（WAITING_LOGIN 等）在大 QMT 接口面观察不到，不编造。实盘验证：`[{'account_id': '...', 'status': 0}]`。
+
+- **SDK 与 ContextInfo 两条路都失败时，错误只报后者**（issue #277，@OdinCN）：`download_financial_data` 在 miniQMT 停掉时，用户看到的是 `NotImplementedError: ContextInfo.download_financial_data is not available`——真正的原因（SDK 报「无法连接行情服务」）被吞了。现在双路皆败时错误同时带两边：SDK 的原始原因 + ContextInfo 的。
+
+- **`get_market_data` 宽表的时间列类型对齐 miniQMT**（#278 跟进）：0.3.34 把纯数字时间列转成了 int，而 miniQMT 的 time_list 实测是 **str**（`data['open'].columns` dtype='str'——两边打印出来都不带引号，只有 dtype 能区分）。改为全部转 str，与 miniQMT 完全一致。
+
+### 文档
+
+- **README：批量下载用 `download_history_data2` 整批传**（issue #275，@pujfei）：循环单票各付一次最坏 60s 的可见性等待，整批共用一次（10 票实测 2.2s）。阻塞是刻意的（下载语义=落库后可见）。
+- **README：QMT 设置「启用自动初始化」取消勾选可长期不重启**（issue #276，@pujfei）；升级桥代码后仍需手动重启策略。
+
+## [0.3.34] - 2026-09-10
+
+### 修复
+
+- **`get_market_data` 超过 500 只票经常 RPC 超时**（用户实测反馈，2026-09-10，issue #278）：它一直走 QMT 主线程 RPC，而 `get_market_data_ex` 早就走 FormulaServer 直连。现在 `get_market_data` 也挂进同一条 `getMarketData` 直连（复用同一参数翻译/结果适配），盘中形成 bar 的滞后检查与冷却自愈和 md_ex 对齐；复权（front/back）读取仍回落 RPC（FormulaServer 不出复权价）。实盘实测（国金，600 只 × 5 字段 × 10 天）：RPC 桥 **>30s 超时** → 直连 **718ms**；客户端方法全程（含文档形状转换）500 只 **252ms**。注意：0.3.32  changelog 记录的「get_market_data 文档形状」修复当时 tag 里并没有代码（拓扑错位），本版才真正随包发出。
+
+### 文档
+
+- **README 写明 `get_financial_data` 的两个前提**（用户问）：数据必须在终端本地（大 QMT 没有可用的下载通道，只能在 QMT 界面数据管理里下载）；`start_time`/`end_time` 留空直接返回 None——日期区间必须给。
 ## [0.3.33] - 2026-09-10
 
 对齐 MiniQMT 契约：账户查询从 dict 改成可属性访问的行对象（现场报错 `'dict' object has no attribute 'm_nStatus'`），另按终端自带的 `xttype` 逐个对账，补齐七处回调与返回对象缺的字段（#271）。
@@ -53,6 +161,9 @@
 客户端方法补齐与合成周期回落（#262 / #237），另修两处取值 bug：上午五位 HHMMSS 成交时间被解析成 0（#266，由 @shengyy 报告并提交 #267），以及显式传空的 `strategy_name` 被替换成 `bigqmt_rpc`（#268）。
 
 ### 修复
+
+- **`get_market_data` 返回形状不符合 MiniQMT 文档契约**（用户实测反馈，2026-09-10）：文档约定 bar 周期返回 `dict[field] -> DataFrame(index=stock_list, columns=time_list)`，而大 QMT 实际返回单票裸长表 / 多票 `dict[stock]->长表`，桥原样透传，按文档写的客户端代码全挂。现在在**客户端**转成文档形状（服务端不动、raw-RPC 不变、全零自愈路径不受影响、不用动 QMT 端）；时间列若是纯数字字符串会恢复成 int（`frame[20260901]` 可取）。tick 周期与非长表应答原样直通。实盘验证：`dict` 五字段齐全、`index=['510880.SH']`、`columns` 为 int 日期。
+
 
 - **README 按名字列出来的「合约/品种」方法，客户端一个都调不到**（#262，由
   @pujfei 报告）。`xtdata.get_stock_name("513100.SH")` 好用、

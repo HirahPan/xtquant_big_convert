@@ -111,3 +111,42 @@ class NativeNegativeCacheTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BothPathsErrorChainingTest(unittest.TestCase):
+    """When both paths fail, the SDK's own reason must not be buried (#277)."""
+
+    def test_both_failures_are_chained(self):
+        native = _FakeNativeModule(fail=True)
+        native.get_trading_dates = lambda *a: (_ for _ in ()).throw(
+            ConnectionError("无法连接行情服务"))
+        provider = BigQmtMarketDataProvider(
+            type("C", (), {"get_trading_dates": lambda self, *a: (_ for _ in ()).throw(
+                NotImplementedError("ContextInfo.download_financial_data is not available"))})(),
+            native_xtdata=native)
+
+        with self.assertRaises(RuntimeError) as cm:
+            provider._native_or_context(
+                "get_trading_dates",
+                provider._call_context)
+
+        message = str(cm.exception)
+        self.assertIn("无法连接行情服务", message)
+        self.assertIn("ContextInfo", message)
+
+    def test_native_success_skips_the_chain(self):
+        native = _FakeNativeModule(fail=False)
+        provider = BigQmtMarketDataProvider(
+            type("C", (), {"get_trading_dates": lambda self, *a: ["ctx"]})(),
+            native_xtdata=native)
+        out = provider._native_or_context(
+            "get_trading_dates", provider._call_context, "SH", "", "", 5)
+        self.assertEqual(out, ["20260901", "20260902"])
+
+    def test_context_only_failure_keeps_the_plain_error(self):
+        provider = BigQmtMarketDataProvider(_FakeContext(), native_xtdata=None)
+        provider._native = lambda: None
+        with self.assertRaises(NotImplementedError):
+            provider._native_or_context(
+                "get_trading_dates",
+                lambda: (_ for _ in ()).throw(NotImplementedError("no such method")))

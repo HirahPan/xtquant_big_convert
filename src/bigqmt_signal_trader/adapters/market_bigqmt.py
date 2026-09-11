@@ -185,19 +185,53 @@ def _raw_frame_columns(field_list):
     return columns
 
 
+def _records_have_rows(records):
+    """True when ``records`` carries at least one bar.
+
+    ``get_market_data_ex_ori`` answers two empty shapes:
+
+    * a list of rows (``[]``)
+    * a dict of column arrays whose every array has length 0
+
+    The column-dict is truthy in Python. On Guojin 2.0.8.0 that is the
+    empty answer for 1mon+ (12 keys, all length 0, measured 2026-09-11).
+    ``if records:`` treated it as data, so #237's rescue never ran: the
+    primary was kept, ``synth_fallback_only=True`` (which skips it) still
+    answered 10 rows from ``ContextInfo.get_market_data``.
+    """
+    if records is None:
+        return False
+    if isinstance(records, dict):
+        if records.get("__bigqmt_type__") == "DataFrame":
+            return _records_have_rows(records.get("records"))
+        for column in records.values():
+            try:
+                if len(column) > 0:
+                    return True
+            except TypeError:
+                if column not in (None, ""):
+                    return True
+        return False
+    try:
+        return len(records) > 0
+    except TypeError:
+        return bool(records)
+
+
 def _market_data_answer_empty(answer):
     """True when no code in the answer carries a single row.
 
     Covers both shapes get_market_data_ex can return: the raw path's
-    serialisable marker dict (records list) and the plain path's pandas
-    frames (index length). Anything unrecognised counts as an answer rather
-    than as empty -- a retry must never replace data with nothing.
+    serialisable marker dict (records list *or* a dict of column arrays)
+    and the plain path's pandas frames (index length). Anything
+    unrecognised counts as an answer rather than as empty -- a retry must
+    never replace data with nothing.
     """
     if not isinstance(answer, dict) or not answer:
         return True
     for value in answer.values():
         if isinstance(value, dict) and value.get("__bigqmt_type__") == "DataFrame":
-            if value.get("records"):
+            if _records_have_rows(value.get("records")):
                 return False
         elif hasattr(value, "index"):
             try:
@@ -205,7 +239,7 @@ def _market_data_answer_empty(answer):
                     return False
             except Exception:
                 return False
-        elif value:
+        elif _records_have_rows(value):
             return False
     return True
 
@@ -670,6 +704,7 @@ class BigQmtMarketDataProvider:
         get_trading_dates cost 2.1s per call forever (issue #160).
         """
         module = self._native()
+        native_error = None
         if module is not None and not self._native_known_dead(func_name):
             fn = getattr(module, func_name, None)
             if fn is not None:
@@ -677,12 +712,24 @@ class BigQmtMarketDataProvider:
                     result = fn(*args, **kwargs)
                     self._native_dead_marks().pop(func_name, None)
                     return result
-                except Exception:
+                except Exception as exc:
                     # Big QMT path: SDK present but no quote service to talk
                     # to ("无法连接行情服务"). Don't crash — let the ContextInfo
                     # fallback have a turn.
+                    native_error = exc
                     self._native_dead_marks()[func_name] = time.time()
-        return context_caller()
+        try:
+            return context_caller()
+        except Exception as context_error:
+            if native_error is not None:
+                # Both paths failed: the SDK's own reason (e.g. "无法连接行情服务"
+                # when miniQMT is down) is the actionable one, and it must not be
+                # buried under ContextInfo's bare NotImplementedError (#277).
+                raise RuntimeError(
+                    "%s failed on both paths: SDK %s: %s | ContextInfo %s: %s"
+                    % (func_name, native_error.__class__.__name__, native_error,
+                       context_error.__class__.__name__, context_error))
+            raise
 
     def _call_first_supported_named(self, shapes):
         """``(method_name, args, kwargs, result)`` for the shape that bound.
@@ -1636,12 +1683,24 @@ class BigQmtMarketDataProvider:
     # get_stock_list_in_sector / get_sector. Used as a fallback when the full
     # sector list is not enumerable (Big QMT has no get_sector_list method and
     # the xtdata SDK's quote service is unreachable inside the full terminal).
+    #
+    # Every name here was fed to get_stock_list_in_sector on a live 国金 Big
+    # QMT 2.1.19.0 terminal (2026-09-11). Two of the original thirteen came
+    # back empty and are corrected below: the A-share halves are spelt 上证 /
+    # 深证 on this terminal, while 沪市A股 / 深市A股 return 0 rows. Funds go
+    # the other way -- 沪市基金 / 深市基金 answer and 上证基金 / 深证基金 do
+    # not -- so the spelling cannot be inferred, only measured. 中金所 also
+    # returned 0 on a STOCK account, which reads as a permission gap rather
+    # than a wrong name, so it stays.
     _FALLBACK_SECTORS = (
-        "沪深A股", "沪市A股", "深市A股", "科创板", "创业板",
+        "沪深A股", "上证A股", "深证A股", "科创板", "创业板",
         "上证期权", "深证期权", "中金所",
         "沪市债券", "深市债券",
         "沪市基金", "深市基金", "沪深ETF",
     )
+    # The two spellings that look right and answer with nothing. Kept so a
+    # test can pin that they never creep back into the list above.
+    _EMPTY_ON_BIG_QMT = ("沪市A股", "深市A股")
 
     def get_sector_list(self, allow_fallback=False):
         """Return the terminal's sector names, or say it cannot (issue #143).

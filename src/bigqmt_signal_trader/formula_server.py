@@ -610,6 +610,11 @@ METHOD_MAP = {
     "get_weight_in_index": ("getWeightInIndex", _weight_in_index_params, _scalar_result),
     "get_stock_list_in_sector": ("getStockListInSector", _sector_params, _list_result),
     "get_market_data_ex": ("getMarketData", _market_data_params, _market_data_result),
+    # Same bars, different contract: get_market_data documents
+    # dict[field]->wide-frame, which the client pivots after this answers.
+    # Routing it here takes a 500+-code read off the QMT strategy thread
+    # (repeated RPC timeouts, 2026-09-10 report).
+    "get_market_data": ("getMarketData", _market_data_params, _market_data_result),
 }
 
 SUPPORTED_METHODS = tuple(sorted(METHOD_MAP))

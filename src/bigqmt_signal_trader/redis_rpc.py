@@ -1939,8 +1939,35 @@ class BigQmtRpcHandlers:
         return self._query_trade_detail(params, "ACCOUNT")
 
     def _handle_query_account_status(self, params):
-        # 账户状态 — 用 TASK detail type 近似（委托任务状态）
-        return self._query_trade_detail(params, "TASK")
+        # 账户状态。Big QMT 没有原生账号状态结构——官方 strDatatype 只有
+        # ACCOUNT / POSITION / POSITION_STATISTICS / ORDER / DEAL / TASK，
+        # TASK 是委托任务状态，占位实现期误用了它：没有进行中的委托任务时恒
+        # 空，和「账号状态查不到」是两回事（issue #272）。
+        #
+        # 能拿到的最近真源是 ACCOUNT 行的 m_Enable：
+        #   账户存在且可用   -> ACCOUNT_STATUS_OK(0)
+        #   账户存在但不可用 -> ACCOUNT_STATUS_FAIL(3)
+        #   没有 ACCOUNT 行  -> 空列表（账号不存在）
+        # MiniQMT 更丰富的状态（WAITING_LOGIN / INITING / CORRECTING / CLOSED）
+        # 在大 QMT 的接口面上观察不到，别在这里编造。
+        rows = self._query_trade_detail(params, "ACCOUNT")
+        account_id = self._request_account_id(params)
+        account_type = self._reported_account_type()
+        out = []
+        for row in rows or []:
+            if isinstance(row, dict):
+                enabled = row.get("m_Enable")
+                row_account = row.get("m_strAccountID")
+            else:
+                enabled = getattr(row, "m_Enable", None)
+                row_account = getattr(row, "m_strAccountID", None)
+            out.append({
+                "account_id": str(row_account or account_id),
+                "account_type": account_type,
+                "status": 0 if enabled else 3,
+                "status_msg": "" if enabled else "account disabled (m_Enable=False)",
+            })
+        return out
 
     def _handle_query_credit_detail(self, params):
         # 信用（两融）账户明细 — get_trade_detail_data(accId, 'CREDIT', 'ACCOUNT')
