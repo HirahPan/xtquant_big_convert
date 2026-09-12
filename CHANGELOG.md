@@ -3,6 +3,95 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [0.3.40] - 2026-09-12
+
+两处由 @shengyy 带离线复现报告的修复：`BigQmtRpcClient(redis_config=...)` 显式传的功能开关不再被配置模块覆盖（#289）；POSITION 行缺数量字段时报错，不再补成与原生 0 无法区分的 0（#290）。
+
+### 修复
+
+- **POSITION 行缺数量字段时被补成 0，与原生明确为 0 无法区分**（#290，由 @shengyy 带
+  离线复现报告）。`m_nVolume` / `m_nCanUseVolume` / `m_nYesterdayVolume` 原来走
+  `int(_attr(row, names, 0) or 0)`，缺属性的行序列化出来和终端明确说 0 的行逐字节相同，
+  "不知道持多少"和"持仓为零"在 adapter 这层就混成一个了，走公开 raw RPC 也救不回来。
+  读 0 当"空仓"的策略会重复买入，读 0 当"没有可卖"的策略永远不卖。
+
+  这三个是大 QMT POSITION 结构里无条件的 `int` 成员（`BIGQMT_INNER_PYTHON_API_REFERENCE`
+  没给它们标"股票不适用"，周围期货专属字段是标了的），#81 在 6 只实盘持仓上逐行核对过。
+  缺了就是终端自己的契约没守住。现在 adapter 直接抛 `ValueError`，点名代码、账户和缺的
+  字段，经 #229/#230 已有的路径以 `ok=False, error=...` 传回，客户端拿到异常而不是数据。
+  原生明确的 0 仍是 0，原生空结果仍是空结果。`frozen_volume` / `on_road_volume` 不在此列，
+  报告未涉及、也不决定"持多少/能卖多少"。
+
+  今天（周六、终端刚重启）实盘 POSITION 缓存为空，原生行的字段形状没能当场探到；契约依据
+  是上面的结构文档和 #81 的历史实测。
+
+- **`BigQmtRpcClient(redis_config=...)` 显式传的三个功能开关被配置模块覆盖**（#289，由
+  @shengyy 带离线复现报告）。构造函数开头对 host/port/password 的规则是显式参数覆盖配置
+  模块（`merged_redis_config.update(redis_config)`），但三个功能段各自违背了它：
+  `local_cache` 先读模块段、显式值只当 `.get` 的兜底；`formula_server` 用 `or` 链把模块段
+  排在显式 dict 前面，模块里只要有这个段，显式传的整个 dict 直接丢弃、连合并都没有；
+  `full_tick` 压根不读 `redis_config`，所以没有配置模块时构造开关也不起作用。报告人的
+  复现：模块三个都说 True、构造函数三个都传 False，得到 True True True；没有模块时传
+  `full_tick_cache_enabled=True` 得到 False。
+
+  现在三个段统一走 `_ClientSetting`：显式 `redis_config` > 配置模块 > 环境变量 / 默认，
+  和 host/port/password 同一个顺序。`formula_server` 改为逐键合并而不是二选一，调用方没
+  提的键保留模块的值。配置模块内部 `BIGQMT_REDIS_CONFIG` 平铺键与专用段的先后由
+  `load_client_config` 决定、本次不动。
+
+## [0.3.39] - 2026-09-12
+
+三处修复：策略首跑那条 `unknown encoding: idna` 不再出现（#288），`xtdata.get_divid_factors()` 返回对齐 miniQMT 实测形状的 DataFrame（#287），订单诊断信息不再把转债价格截成两位小数（#282）。
+
+### 修复
+
+- **订单诊断信息把价格按 `%.2f` 格式化，转债的三位小数被截掉**（#282）。「委托没落地」
+  那条诊断会回显下单价格，`128.456` 显示成 `128.46`，看诊断的人拿到的价格和实际报出去
+  的不是同一个。改成 `%s` 原样输出。
+
+- **策略第一次跑，首个 adjust tick 报 `LookupError: unknown encoding: idna`**，再跑
+  就没有。`socket.getaddrinfo` 把主机名按 `idna` 编码，这个编码器是懒加载的：
+  `codecs.lookup('idna')` → `encodings.search_function` → `import encodings.idna` →
+  `stringprep` → `unicodedata`（`DLLs\` 下的 C 扩展）。首次连 Redis 发生在 adjust
+  线程（C++ 定时器回调）上、init 刚落定那一刻，沙箱化的 importer 在那个线程上加载扩展
+  会失败（#135 对 `importlib.reload` 记过同样的事）；`search_function` 把 ImportError
+  吞成「unknown encoding」，调用方看到的是个二手错误。下一个 tick 重连成功、模块进了
+  `sys.modules`，QMT 跨策略重跑保留 `sys.modules`，于是再也不出现——看着像偶发。
+
+  三个模块在 QMT 自带的 3.6.8 里单独都能加载，不是缺模块，是时机。现在
+  `redis_transport` 模块加载时（主线程、init 阶段、adjust 定时器还不存在）就
+  `import encodings.idna` 并 `codecs.lookup('idna')` 一次：前者让后续 `__import__`
+  在 `sys.modules` 短路、不经过 finder，后者把编码器缓存预热、adjust 线程的 lookup
+  连 `search_function` 都不调。PyInstaller 防同一个错用的就是这招。带守卫，沙箱真拒绝
+  也不会把 transport 模块带崩。
+
+  影响只是首次运行丢一个 adjust tick 的 drain（默认 100ms），请求在队列里等下一个
+  tick，什么都没丢；改的是那条带完整 traceback 的 ERROR 不再出现。
+
+- **`xtdata.get_divid_factors()` 返回 dict，不是 DataFrame**。在真 miniQMT 上实测
+  `df.info()`：`Index: 19990823 to 20080707`，八列 `time` / `interest` / `stockBonus` /
+  `stockGift` / `allotNum` / `allotPrice` / `gugai` / `dr`，`dtypes: float64(8)`——一行一个
+  除权日，索引是 YYYYMMDD，`time` 列是当天的毫秒戳。桥的客户端把 RPC 应答原样透传，
+  而应答是大 QMT 原生的 `dict{毫秒时间戳: [7 个数]}`：值和顺序都一样，但没有名字、日期
+  还是毫秒戳、`gugai` 是 int。照着真 xtdata 写的调用方 `df["dr"]` 是 KeyError，
+  `df.loc["20260626"]` 取不到，`df.tail()` 是 AttributeError。
+
+  现在客户端补日期索引、`time` 列、列名和 float64，和 `get_market_data_ex` 把线上
+  records 落成 frame 是同一种做法。毫秒戳是上海零点（三个实盘样本
+  `(ms/1000 + 8h) % 86400` 都是 0），折成 YYYYMMDD 用固定 +8h，不看客户端机器时区。
+  **线上格式不变**，走原始 RPC 和 `getDividFactors` 别名拿到的还是那个 dict。行序保持
+  服务端给的，不排序。
+
+  列序用国金 2.1.19.0 实盘数据钉住：000001.SZ 在 2000 年那次配股，两个非零值必须落在
+  `allotNum`（0.3）和 `allotPrice`（8.0）而不是 `interest`。600519.SH 端到端
+  `Index: 30 entries, 20020725 to 20260626`，8 列全 float64。
+
+- **RPC 参考里 `get_divid_factors` 那段参数说明还是 #165 修前的老话**（"实际只把
+  `end_time` 作为单个 `date` 传入"），区间早就是真区间了。按现状重写，并补上线上格式与
+  客户端返回格式的区别。
+
+---
+
 ## [0.3.38] - 2026-09-11
 
 文档版。部署快速开始重写：`bigqmt-init` 嵌进流程并写明它不做什么，新增「升级已有部署」一节，按实际跑过两遍的流程写（#285）。代码与 0.3.37 相同。
