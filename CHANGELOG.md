@@ -3,6 +3,88 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [0.3.47] - 2026-09-17
+
+三条：方式一多账号副账号的委托/成交回调（#320/#322，按事件账号选频道 + 副账号轮询合成事件，闸门 2 在顶层策略文件要重启）、Redis 后台 BRPOP 存活时 adjust 不再抢 LPOP（#321，@wsmh）、部署脚本 redis zip 校验 + 原子下载（#323，@karlthas007，含两个分支 bug 的跟修）。
+
+### 修复
+
+- **方式一多账号下副账号的 `on_stock_order` / `on_stock_trade` 收不到**（#320 @JinHaoran、#322
+  @shihaibi——同一件事，#322 把两道闸门都点出来了）。闸门 2：事件按**配置的主账号**发到
+  `bigqmt:order_events:<主账号>`，副账号客户端订的是自己的频道，主账号客户端也当它是主账号
+  的单——现在按回报对象自带的 `m_strAccountID` 选频道，配置账号只作兜底。闸门 1：大 QMT 的
+  `order_callback` / `deal_callback` 只回绑定账号的，副账号的委托成交进程里根本看不到，也没有
+  MiniQMT 那种 `subscribe(account)`——新增 `secondary_exec_poll`：多账号管理器在 adjust 拍上
+  对每个副账号轮询 `get_trade_detail_data`（ORDER / DEAL，主线程才答得出），委托按
+  `(合同编号, 状态, 成交量)` 变化发一次、成交按成交编号发一次，经同一套 normalizer 发到该账号
+  自己的频道，废单同样补发 `on_order_error`。启动后第一次轮询只建基线不发（重启不回放当天）。
+  默认每 1 秒一次，`rpc.secondary_exec_poll_seconds` 可调、0 关；延迟一个轮询间隔，一个间隔内
+  连跳多个状态只发最后一个。单账号部署不建轮询器，行为不变。闸门 2 在顶层策略文件里，
+  **需要重启策略**；轮询器在包内。没有双账号终端可实测，请报告者部署后用副账号下一笔验证。
+
+- **Redis 后台 BRPOP 存活时，adjust 线程不要再 LPOP 同一条请求队列**。``rpc_background_threads=True`` 时 ``_queue_loop`` 已经在消费 ``bigqmt:rpc:queue:*``；adjust 上的 ``drain_request_queue`` 再用 LPOP 会把 ``get_market_data_ex`` 等读请求抢到 QMT 主线程，实测把 100ms 节拍拖到 0.6–1.8s。后台线程活着就跳过 LPOP，线程挂了才回落 LPOP。（#321，@wsmh）
+
+- **`deploy_qmt_bridge.ps1` 第 3 步 redis zip 下载：校验 + 原子改名**（#323，@karlthas007）：
+  下载中断留下的半截 zip 不再被当成好的——`Test-RedisZip` 打开归档确认含 `redis-server.exe`；
+  curl 先写到 `.download` 并带 `--retry 3 --max-time 1800`，校验通过才改名到位；新增 `-RedisUrl`
+  指定镜像源。合并后修了它的两个分支 bug（Windows PowerShell 5.1 下逐分支跑过）：
+  全新机器不传 `-RedisZip` 时默认路径不存在被当成「文件没找到」直接 throw，下载根本不会
+  执行；下载参数里的 `(if ($RedisUrl) {...} else {...})` 在 5.1 不是表达式，报
+  `The term 'if' is not recognized`。现在只有显式传的 `-RedisZip` 缺失/损坏才报错，默认路径
+  缺失或损坏一律走下载；源地址先赋变量再进参数数组。
+
+
+## [0.3.46] - 2026-09-17
+
+四个 issue 一起：江海 QMT `get_full_tick` 只回答已订阅代码（#310）、归还融资走 MiniQMT 写法被拒（#314）、方式一多账号副账号行情无回调（#315）、`278de3f` 的 preClose lag 兜底收窄并修回 11 个测试。
+
+### 修复
+
+- **江海证券大 QMT 2.1.19.0 上 `get_full_tick` 对任何代码都返回 `{}`**（#310）。该终端的
+  `ContextInfo.get_full_tick` 只回答**已订阅**的代码：没订阅的代码不报错，直接没有条目，
+  单代码和 `["SH"]` 整市场都一样；ping / 持仓 / `get_market_data_ex` 全部正常，看上去像
+  桥的回归。报告者实测 `subscribe_whole_quote(["600052.SH"])` 后再问就有完整五档。现在
+  `get_ticks` 在原生快照**漏掉了请求的代码**时，才对漏掉的代码（市场 token 按 token 订，
+  不按展开后的股票清单订）做一次 `subscribe_whole_quote`，然后重读直到出现或等满 2 秒
+  （`TICK_SUBSCRIBE_WAIT_SECONDS`）；同一批代码之后的调用直接读，不再等。已订阅仍然没有
+  条目的代码（停牌 / 退市 / 未开盘）按原样返回，不重复订、不重复等。订阅 300 秒没被
+  `get_full_tick` 碰过就 `unsubscribe_quote` 掉（`prune_tick_subscriptions`，adjust 循环
+  每拍调一次，包内也在下次 `get_ticks` 时懒回收）。国金的构建会回答未订阅代码，所以
+  在那里这条路径从不触发（有测试钉住）。
+
+  **未验证**：本机是国金 2.1.19.0，原生 `get_full_tick` 不需要订阅，所以订阅后到快照出现
+  的实际延迟、以及 `subscribe_whole_quote(["SH"])` 在江海构建上是否足以让整市场快照出现，
+  只能由 #310 的报告者在其终端上确认。
+
+- **归还融资走 MiniQMT 写法被拒：`order_type 32 has no implicit buy/sell side; pass action explicitly`**
+  （#314，@fengzhizialex）。#103 让 直接还款（32 / 45）必须显式传 `action`，理由是它没有证券腿、
+  猜方向不对。但 MiniQMT 的 `order_stock(acc, code, order_type, volume, price_type, price,
+  strategy, remark)` 签名里根本没有 `action`——按官方写法 `order_stock(acc, code,
+  CREDIT_DIRECT_CASH_REPAY, 金额, FIX_PRICE, 0, ...)` 归还融资，兼容层无处可传，等于这条
+  路根本走不通。行权 / 锁定 / 解锁（56-59）同样。
+
+  方向本来只用于记账：送进 `passorder` 的是原始 opType（32 → 32，45 → 75），和方向无关。
+  现在无方向类型不传 `action` 也接受，记账方向记 `SELL`；结算回找对这些类型**不按方向过滤**
+  ——终端那一行报成哪边都认，不会再因为记账方向和终端不一致而在 3 秒后报「order not found
+  in system」。显式传了 `action` 仍以传的为准；有方向的类型（融资买入 27、卖券还款 31 等）
+  行为不变。
+
+- **方式一多账号（`BIGQMT_ACCOUNT_TYPE_MAP` 单实例）下，副账号的全推行情「订阅成功但无回调」**
+  （#315，@JinHaoran）。推送通道按账号命名：服务端只往 `bigqmt:quote_push:<主账号>:<topic>`
+  发，而按副账号配置的客户端订的是 `bigqmt:quote_push:<副账号>:<topic>`。副账号的
+  `subscribe_whole_quote` 走自己的请求通道落到共用的 handlers、正常返回 seq，所以不报错——
+  推送只是发到了没人听的频道。行情不分账号，现在发布端替桥服务的每个账号各发一份
+  （redis 每账号一次 `publish`；zmq 的 PUB socket 多绑一个副账号的地址）。账号列表默认读
+  `BIGQMT_ACCOUNT_TYPE_MAP`，单账号部署形状不变。客户端不用改。
+
+- **`278de3f`（K线 preClose 行级 lag 兜底）收窄作用范围**：第一版对所有帧无条件动作，打红了
+  11 个测试，两条是真的语义倒退——(1) 显式 `field_list` 没点 `preClose` 也会多出这一列，
+  返回形状和 MiniQMT 不一致；(2) `1w` 的 preClose 终端恒为 0，#166 按日线取周首日真实前收
+  回填，lag 先把 0 盖掉后回填看不到「缺」，除权在周首日的那周就是错价。现在只在调用方要了
+  这列（`field_list` 为空或点了 `preClose`）时补列；有精确回填来源的周期（`1w`）不用 lag
+  填 0，回填关掉或没有日线时按 #166 的约定留 0。其余周期的 0 行和缺列仍按 `278de3f` 用前
+  一根 close 补。默认下载字段含 `preClose`（MiniQMT 全字段有它）这一条保留，对应测试更新。
+
 ## [0.3.45] - 2026-09-16
 
 ### 修复

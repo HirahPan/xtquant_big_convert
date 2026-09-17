@@ -922,6 +922,19 @@ def _drain_rpc_service(config):
             _quote_subscription_service[0].reap_expired()
         except Exception as exc:
             _log_err("quote_push", "reap failed: %s" % exc)
+    # #310 warm-up subscriptions (terminals whose get_full_tick answers only
+    # subscribed codes) are dropped once idle; getattr-guarded so a package
+    # from before the warm-up still drains.
+    # The provider hangs off the handlers (service.handlers.market_data); the
+    # service itself has no market_data, so reading it there found None and
+    # the adjust-loop prune never ran.
+    prune = getattr(getattr(getattr(_rpc_service, "handlers", None), "market_data", None),
+                    "prune_tick_subscriptions", None)
+    if callable(prune):
+        try:
+            prune()
+        except Exception as exc:
+            _log_err("full_tick", "warm-up prune failed: %s" % exc)
     return processed
 
 
@@ -1838,6 +1851,23 @@ def _enrich_event_identity(exec_events, config, account_id, event):
     return event
 
 
+def _event_account_id(obj):
+    """The account a native order / deal object names, or "" (#320).
+
+    Reading an attribute off a QMT object can itself raise (#76's
+    SystemError), and this runs on the C++ callback thread before the
+    guarded block below -- so it must never let anything out.
+    """
+    for name in ("m_strAccountID", "account_id"):
+        try:
+            value = getattr(obj, name, None)
+        except Exception:
+            return ""
+        if value:
+            return str(value).strip()
+    return ""
+
+
 def _publish_exec_event(kind, obj, context_info=None):
     """Push a normalized order/trade event to Redis for real-time client callbacks."""
     config = _build_config()
@@ -1858,7 +1888,13 @@ def _publish_exec_event(kind, obj, context_info=None):
             print("[bigqmt_exec_raw] snapshot %s failed: %s" % (kind, exc))
     if not _config_bool(event_config.get("enabled"), True):
         return
-    account_id = str(event_config.get("account_id") or config.get("account_id") or _account_id or "")
+    # The channel is per account, so it has to be THIS event's account: a
+    # callback for a secondary account (方式一) published under the
+    # configured primary landed where nobody was listening (#320, #322).
+    # The row names its account; the configured one is only the fallback.
+    account_id = str(
+        _event_account_id(obj)
+        or event_config.get("account_id") or config.get("account_id") or _account_id or "")
     if not account_id:
         return
     sink = _exec_event_sink(config)

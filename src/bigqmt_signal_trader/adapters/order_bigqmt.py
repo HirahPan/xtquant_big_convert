@@ -252,7 +252,26 @@ _ETF_OPTION_SELL_SIDE = frozenset({
     54,  # 备兑开仓
 })
 # 56 认购行权 / 57 认沽行权 / 58 证券锁定 / 59 证券解锁 没有买卖方向，
-# 和 直接还款(32) 一样必须由调用方显式传 action。
+# 和 直接还款(32 / 45) 一样：没有证券腿，BUY/SELL 都不对。
+#
+# 这些类型曾要求调用方显式传 action（#103）。但 MiniQMT 的 order_stock 签名里
+# 根本没有 action 这个参数——按官方写法 `order_stock(acc, code, CREDIT_DIRECT_CASH_REPAY,
+# 金额, FIX_PRICE, 0, ...)` 归还融资，兼容层无处可传，直接被拒（#314）。所以
+# 无方向类型不再要求 action：记账方向记成 SIDELESS_DEFAULT_ACTION，真正送进
+# passorder 的仍是原始 opType，结算回找对这些类型不按方向过滤。
+SIDELESS_ORDER_TYPES = frozenset({
+    _XC.CREDIT_DIRECT_CASH_REPAY, _XC.CREDIT_DIRECT_CASH_REPAY_SPECIAL,   # 32 / 45
+    56, 57, 58, 59,
+})
+SIDELESS_DEFAULT_ACTION = SignalAction.SELL.value
+
+
+def is_sideless_order_type(order_type):
+    """True for order_types that have no buy/sell side (直接还款, 行权, 锁定/解锁)."""
+    try:
+        return int(order_type) in SIDELESS_ORDER_TYPES
+    except (TypeError, ValueError):
+        return False
 
 # 能接受直通 opType 的账号类型（见 init_config.ACCOUNT_TYPES）。
 # 股票账号收到期货 opType 时必须拒绝，不能回落到 23/24 —— 那会真的发出
@@ -286,7 +305,7 @@ def credit_action_of(order_type):
     """BUY / SELL for a credit order_type, or None if it is not one.
 
     直接还款 (32 / 45) moves cash rather than securities, so it has no side;
-    callers must pass an action for it explicitly.
+    the handler records SIDELESS_DEFAULT_ACTION for it (#314).
     """
     try:
         value = int(order_type)
@@ -634,6 +653,17 @@ class BigQmtOrderGateway:
         account_type = self._resolve_account_type(aid)
         ok = cancel_func(order_ref.order_sys_id, aid, account_type, self.context_info)
         return CancelResult(success=bool(ok), message="" if ok else "cancel returned false")
+
+    def query_native_rows(self, account_id, kind, strategy_name=""):
+        """The terminal's own ORDER / DEAL rows for ``account_id``, unconverted.
+
+        For the secondary-account exec-event poller (#320): the rows are the
+        same objects the callbacks deliver, so they go through the same
+        normalizers. Main thread only, like every get_trade_detail_data.
+        """
+        query = self._require_query_func()
+        account_type = self._resolve_account_type(account_id)
+        return query(account_id, account_type, str(kind or "ORDER").upper(), strategy_name) or []
 
     def query_orders(self, account_id, strategy_name):
         return self.query_orders_strict(account_id, strategy_name)

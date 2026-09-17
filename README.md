@@ -926,35 +926,32 @@ BIGQMT_REDIS_CONFIG = {
 - **主账号 = 策略在 QMT 里绑定的那个**。QMT 的模型交易一个实例只绑一个账号（界面选定），`BIGQMT_ACCOUNT_ID` 必须是它，否则 `passorder` 走的账号和策略绑定的对不上。
 - **交易类请求不并发**。secondary 在后台线程收请求，但 `submit` / `cancel` / 持仓委托查询都 defer 到主账号的 adjust 线程排队执行——`get_trade_detail_data` 离开主线程返回空，这是 QMT 的约束，不是桥的。
 - **撤单按 `account_id` 路由**（#171 起）。此前 `cancel` 一律用网关自己的账号，双账号里撤期货委托会用股票账号发出去。
+- **副账号的委托/成交回调靠轮询**（#320 起）。大 QMT 的 `order_callback` / `deal_callback` 只回策略绑定的主账号，副账号的单进程里根本看不到。桥在 adjust 拍上每秒对副账号查一次 `get_trade_detail_data`（ORDER / DEAL），状态有变化就发到该账号自己的 `bigqmt:order_events:<副账号>`——`on_stock_order` / `on_stock_trade` / 废单的 `on_order_error` 都有，延迟约一个轮询间隔（`rpc.secondary_exec_poll_seconds`，默认 1 秒），一个间隔内连跳多个状态只发最后一个；要每个中间状态就用方式二。主账号仍是即时回调。
+- **全推行情推送到每个账号**（#315 起）。推送通道按账号命名（`bigqmt:quote_push:<账号>:<topic>`），此前只发主账号的频道，按副账号配置的客户端「订阅成功但无回调」。现在表里每个账号各发一份，客户端不用改。
 - **已实盘验证**：上面这份配置的形状就是一套实际跑着的 STOCK + FUTURE 部署，dual-channel 收发、副账号的 `account_id` 注入、副账号交易请求被主线程 drain 三条路都在实盘走通了。#171 合并时 CHANGELOG 写的"本仓库从未实跑过"已经不再成立。换券商或换账号类型组合时，仍建议先用小单验一遍副账号的下单、撤单、持仓。
 
-#### 方式二：多策略实例（不改代码，账号在不同客户端时的唯一选择）
+#### 方式二：多策略实例（账号在不同 QMT 客户端时的唯一选择）
 
-为每个账号创建一个独立的配置文件和 DRYRUN 入口。
+**适用条件：每个账号登录在各自的 QMT 客户端里**（不同券商、不同机器，或同一台机器上两个安装目录）。每个客户端是一个独立进程，各自有自己的 `python` 目录，所以什么都不用"指向"——每个目录里放一份**同名**的配置文件和一份入口，各写各的账号：
 
-```python
-# bigqmt_signal_trader_local_config_stock.py  — 股票账号
-BIGQMT_ACCOUNT_ID = "你的股票账号"
-BIGQMT_ACCOUNT_TYPE = "STOCK"
-BIGQMT_REDIS_CONFIG = {
-    "host": "...", "port": 6379, "db": 5, "password": "...",
-    "transport": "redis",          # 或 "zmq"
-    # ...
-}
+```
+D:\国金证券QMT交易端\python\            ← 客户端 A，登录股票账号
+├── bigqmt_signal_trader/
+├── bigqmt_signal_trader_strategy.py
+├── bigqmt_signal_trader_redis_rpc_runtime.py
+├── BIGQMT_REDIS_DRYRUN.py
+└── bigqmt_signal_trader_local_config.py    BIGQMT_ACCOUNT_ID = "股票账号", BIGQMT_ACCOUNT_TYPE = "STOCK"
 
-# bigqmt_signal_trader_local_config_credit.py  — 信用账号
-BIGQMT_ACCOUNT_ID = "你的信用账号"
-BIGQMT_ACCOUNT_TYPE = "CREDIT"
-BIGQMT_REDIS_CONFIG = {
-    "host": "...", "port": 6379, "db": 5, "password": "...",
-    "transport": "redis",
-    # ...
-}
+E:\华泰QMT\python\                       ← 客户端 B，登录信用账号
+├── （同样 4 项）
+└── bigqmt_signal_trader_local_config.py    BIGQMT_ACCOUNT_ID = "信用账号", BIGQMT_ACCOUNT_TYPE = "CREDIT"
 ```
 
-然后在 QMT 策略编辑器里加载两个 DRYRUN 文件（每个指向不同的配置），分别运行。两个实例的 RPC channel 自动隔离（按 account_id）。
+两份配置连同一个 Redis 即可（`host` / `port` / `db` / `password` 相同）。每个客户端在自己的模型交易里加载自己目录下的 `BIGQMT_REDIS_DRYRUN.py`，两个实例的 RPC channel 按 `account_id` 自动隔离（`bigqmt:rpc:queue:<账号>`），互不影响。`bigqmt-init` 在每台/每个目录各跑一遍就是这个结果。
 
-> **zmq 模式注意**：每个实例的 zmq 端口从 account_id 派生（`15560 + account_id mod 100`），不同账号自动不冲突。
+> **同一个 QMT 客户端里跑不了两个实例。** 同一客户端的所有策略共用一个 Python 进程和一份 `sys.modules`，配置模块名 `bigqmt_signal_trader_local_config` 在入口、runtime、strategy 三处写死，第二个实例 import 到的仍是第一份配置——两个实例绑同一个账号，而且都正常启动、不报错。**同一客户端里登录了多个账号，用方式一。**（#261 反馈的"每个指向不同的配置"此前没写清楚：不存在这样的指向，是靠目录隔离。）
+
+> **zmq 模式注意**：每个实例的 zmq 端口从 account_id 派生（`15560 + account_id mod 100`），不同账号自动不冲突；两个客户端在同一台机器上也一样。
 
 **客户端（外部程序）**：为每个账号创建独立的 client/trader 对象。
 
