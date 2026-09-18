@@ -1095,11 +1095,50 @@ def _ensure_preclose_from_lag(df, field_list=None, period=None):
         return df
 
 
+def _ensure_suspend_flag_column(df, field_list=None):
+    """suspendFlag 列形状兜底: 空 field_list(=全字段)或点名时, 缺列则补 0。
+
+    合成回落帧(``synth_period_primary_empty``, #237)的 servant
+    (ContextInfo.get_market_data)只服务 OHLCV+amount 六列, 实测把
+    suspendFlag 混进请求会让整个请求 0 行, 所以服务端给不出这列——
+    MiniQMT 的同请求却带全部 11 列。下游按 MiniQMT 习惯读
+    ``df["suspendFlag"]`` 会 KeyError; 自己 concat 补列会拿到 NaN,
+    对它做整数转换直接 ValueError。
+
+    与 ``_ensure_preclose_from_lag`` 的缺列分支同一条边界: 只在调用方
+    要了这列(field_list 为空或点了 suspendFlag)时补列, 显式点名清单
+    不多出列。值填 0 与该函数对停牌/无数据帧的处理一致(避免下游
+    KeyError); 注意 0 是形状契约的默认值, 不是合成周期的真实停牌
+    标志——真值需要按日线聚合(suspendFlag 在日线 RPC 有真值), 可作
+    后续增强, 同 preClose 的 #166 精确回填之于 lag 的关系。
+    """
+    try:
+        if not hasattr(df, "columns"):
+            return df
+        if "suspendFlag" in df.columns:
+            return df
+        requested = [str(f) for f in (field_list or [])]
+        if requested and "suspendFlag" not in requested:
+            return df
+        out = df.copy()
+        out["suspendFlag"] = 0
+        return out
+    except Exception:
+        return df
+
+
+def _ensure_kline_columns(df, field_list=None, period=None):
+    """K 线可选列的形状兜底组合: preClose(lag) 之后补 suspendFlag。"""
+    return _ensure_suspend_flag_column(
+        _ensure_preclose_from_lag(df, field_list=field_list, period=period),
+        field_list=field_list)
+
+
 def _normalize_market_data_result(data, field_list=None, period=None):
     if not isinstance(data, dict):
-        return _ensure_preclose_from_lag(data, field_list=field_list, period=period)
+        return _ensure_kline_columns(data, field_list=field_list, period=period)
     return {
-        code: _ensure_preclose_from_lag(
+        code: _ensure_kline_columns(
             _normalize_market_data_frame(frame, field_list=field_list),
             field_list=field_list, period=period)
         for code, frame in data.items()
@@ -2676,9 +2715,9 @@ class BigQmtXtData:
                     )
                 data = payload.get(single) if single is not None else payload
             if isinstance(data, dict):
-                return {code: _ensure_preclose_from_lag(frame, field_list=field_list, period=period)
+                return {code: _ensure_kline_columns(frame, field_list=field_list, period=period)
                         for code, frame in data.items()}
-            return _ensure_preclose_from_lag(data, field_list=field_list, period=period)
+            return _ensure_kline_columns(data, field_list=field_list, period=period)
         fields = list(field_list or [])
         result = {}
         missing = []
@@ -2697,7 +2736,7 @@ class BigQmtXtData:
                 df = fetched.get(code)
                 if df is not None and getattr(df, "shape", (0,))[0] > 0:
                     result[code] = self._select_fields(
-                        _ensure_preclose_from_lag(
+                        _ensure_kline_columns(
                             _normalize_market_data_frame(df, field_list=fields),
                             field_list=fields, period=period),
                         fields,
@@ -5973,6 +6012,39 @@ class BigQmtXtTrader:
 
     def query_account_status(self, account=None):
         return self._query_account_list(account, "query_account_status")
+
+    # -- 可转债 转股 / 回售（大 QMT 有、MiniQMT 没有）-----------------------
+    def convert_bond(self, account, stock_code, volume, strategy_name="", order_remark=""):
+        """可转债转股：把 ``volume`` 张转债转成正股（大 QMT passorder opType 80 / 82）。
+
+        MiniQMT 没有这个操作。账户类型决定编号：普通户 80，信用户 82，按
+        ``account.account_type``（StockAccount 的第二个参数）选。返回和
+        ``order_stock`` 一样的 order_id；没有买卖方向，`price` 送 0。
+        转股不可撤销，请先核对代码是转债代码、数量是张数。
+        """
+        return self._convertible_op("convert", account, stock_code, volume,
+                                    strategy_name, order_remark)
+
+    def sell_back_bond(self, account, stock_code, volume, strategy_name="", order_remark=""):
+        """可转债回售：把 ``volume`` 张转债按回售条款卖回发行人（opType 81 / 83）。
+
+        同 ``convert_bond``：普通户 81，信用户 83，按账户类型选；只在回售
+        申报期内有效，其余时间柜台会拒。
+        """
+        return self._convertible_op("sell_back", account, stock_code, volume,
+                                    strategy_name, order_remark)
+
+    def _convertible_op(self, action, account, stock_code, volume, strategy_name, order_remark):
+        from .adapters.order_bigqmt import convertible_optype_for
+
+        account_type = _account_type_name(getattr(account, "account_type", None)) \
+            or getattr(self, "_declared_account_type", "") or "STOCK"
+        op_type = convertible_optype_for(action, account_type)
+        data = self.order_stock_result(
+            account, stock_code, op_type, int(volume), 11, 0.0,
+            strategy_name, order_remark,
+        )
+        return self._order_id(data.get("order_sys_id"))
 
     def query_credit_detail(self, account):
         """信用账户明细，读终端缓存的信用账号对象（同步）。

@@ -3,6 +3,66 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [0.3.49] - 2026-09-18
+
+五条修复：合成回落帧补 `suspendFlag` 列（#331/#332，@yucejade）、日期窗合成回落裁头部垫行（#335，@yucejade）、方式一多账号在 zmq 下副账号起不来（#334，@simonfantasy）、同机多客户端进程订全推行情互相拆台（sub_id 折进 pid）、归还融资金额放错槽位时报错说清（#330）。
+
+### 修复
+
+- **合成回落帧缺 `suspendFlag` 列**（#331 / #332，@yucejade）。回落 servant（`ContextInfo.get_market_data`）
+  一混入 `suspendFlag` 整请求 0 行，所以那条路给不出这列；MiniQMT 全字段有它，下游 `df["suspendFlag"]`
+  KeyError、自己 concat 补出 NaN 再 `int()` 直接崩。现在只在帧缺列且调用方要了这列（`field_list` 空或点名）
+  时建列填 0，已有列不动，显式清单不多出列——边界与 #318 的 preClose 一致。0 是形状契约默认值，
+  不是合成周期的真实停牌标志。
+
+- **同机多个客户端进程订全推行情互相拆台**。`client_id` 默认是每用户一份持久化文件
+  （`~/.cache/bigqmt/quote_client_id`），两个进程共用它，`sub_id` 又各自从 1 数起——服务端按
+  `(client_id, sub_id)` 计数，把两个进程看成一个订阅者：B 退订或心跳断掉，A 的订阅一起被拆。
+  现在 `sub_id` 折进进程号（仍是 int，MiniQMT 的返回形状不变，`unsubscribe_quote` 照传），
+  同机多进程各算各的；跨机器共用同一份配置时仍建议各设 `BIGQMT_QUOTE_CLIENT_ID`。README 加
+  「多个客户端同时用一座桥」一节，说清三条通道各自的多消费者行为和吞吐共享。
+
+- **方式一多账号在 zmq 下副账号起不来**（#334，@simonfantasy）。`_build_secondary` 只有 redis 一条路：
+  zmq 部署下给副账号套了个 redis client 为 None 的 RedisTransport，监听线程死于
+  `'NoneType' object has no attribute 'pubsub'`；能 import redis 的环境则在没人跑的
+  127.0.0.1:6379 上空转。现在 zmq 部署给副账号建自己的 zmq 端点：端口按**副账号**派生——
+  和按该账号配置的 zmq 客户端派生连接地址的规则一致，客户端不用改；host 继承主账号
+  `bind_address` 的，不会退回 loopback。pipe / mysql / shm 没有按账号的寻址，副账号拒建并
+  记日志，不再建在死 client 上。#320 的副账号回报轮询在 zmq 下改走全推通道发（`exec:*`
+  topic），不再因没有 redis sink 而关掉。
+- **归还融资：金额填错槽位时报错说清楚**（#330，@fengzhizialex）。调用方把还款金额放在 `price`、
+  `order_volume` 传了可用资金——`passorder` 的直接还款金额走 **volume 槽（整数元）**，price 被
+  忽略，于是 volume 不到 1 元时报一句干巴巴的 `volume must be positive`，凑够了又按 volume
+  还款。现在 32/45 的这条错误直接写明"金额走 order_volume、price 忽略、你传的是什么"，
+  price>0 时服务端记一条日志。行为没变（一直是 volume），只是把规则说到报错里。
+- **合成回落的日期窗请求也裁头部垫行**（#335，@yucejade）。`count=-1` + `start_time` 早于终端本地
+  覆盖时，servant 把未覆盖的月份垫成"四价 = 窗口内第一根真实收盘、量额 0"的行，形态合法、
+  消费方无法分辨（601318.SH 1mon 从 20250901 起三根 68.40 垫行）；此前只有 count 请求裁。
+  现在日期窗一律裁头部连续垫行，MiniQMT 对未覆盖月份也不返回行。回落 servant 按默认
+  `skip_paused=True` 调，真停牌周期本就不出行，所以这里的平价零量行只能是垫行。
+
+## [0.3.48] - 2026-09-18
+
+可转债：`get_full_tick` 的 `types` 认 `cbond`，转股 / 回售走 passorder 80-83（`convert_bond` / `sell_back_bond`，未实盘验证，请先 1 张试）；`xtquant.xtdata` shim 的 `get_full_tick` 补转发 `types`（#327，@karlthas007）。
+
+### 新增
+
+- **可转债：`get_full_tick` 市场令牌的 `types` 认 `cbond`**（用户提议）。`convertible`（沪深转债）
+  早就有，加 `cbond` / `cb` / `convertible_bond` 三个别名指向同一板块。
+- **可转债转股 / 回售**（用户提议，MiniQMT 没有、大 QMT 有）。`xt_trader.convert_bond(account, code,
+  张数)` 和 `xt_trader.sell_back_bond(account, code, 张数)`，按 `account.account_type` 选大 QMT 的
+  passorder opType：普通户 转股 80 / 回售 81，信用户 82 / 83；返回和 `order_stock` 一样的 order_id。
+  `order_stock` 直接传 80-83 也认（原样透传，没有买卖方向，价格送 0）。MiniQMT 的
+  `OPT_CONVERT_BONDS=51` 是委托记录里的操作码、在 passorder 编号里是卖出平仓，**不**当别名收。
+  没有转债持仓可实测，且转股不可撤销——请先用 1 张验证。
+
+### 修复
+
+- **`xtquant.xtdata` shim 的 `get_full_tick` 不转发 `types`**（#327，@karlthas007）：走 shim 的旧代码
+  `xtdata.get_full_tick(["SH"], types=[...])` 报 `unexpected keyword argument 'types'`，收窄能力用不上。
+  现在原样转发。
+
+
 ## [0.3.47] - 2026-09-17
 
 三条：方式一多账号副账号的委托/成交回调（#320/#322，按事件账号选频道 + 副账号轮询合成事件，闸门 2 在顶层策略文件要重启）、Redis 后台 BRPOP 存活时 adjust 不再抢 LPOP（#321，@wsmh）、部署脚本 redis zip 校验 + 原子下载（#323，@karlthas007，含两个分支 bug 的跟修）。

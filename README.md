@@ -371,6 +371,16 @@ xtdata.unsubscribe_quote(seq)
 
 **验证**：实盘交易日验证 1/20/50/100 只标的，3s 推送节奏稳定，零丢失零乱序；多客户端共享/退订隔离/同客户端多 sub_id 全过；服务端重启恢复（42s 中断后验证两次）。另在完整大 QMT 2.1.19.0 盘中验证显式 `.SHO` 快照、500ms 实时推送及 ETF+期权混合组合。详见 [docs/SUBSCRIBE_WHOLE_QUOTE_PUSH.md](docs/SUBSCRIBE_WHOLE_QUOTE_PUSH.md) 和 [docs/SUBSCRIBE_WHOLE_QUOTE_LIVE_VERIFICATION.md](docs/SUBSCRIBE_WHOLE_QUOTE_LIVE_VERIFICATION.md)。
 
+### 多个客户端同时用一座桥
+
+可以，redis 模式天然支持多消费者，三条通道各自的机制：
+
+| 通道 | 多客户端怎么工作 | 注意 |
+|---|---|---|
+| **RPC 查询**（行情快照、持仓、委托、下单） | 每个请求带自己的 `request_id`，回复写到 `bigqmt:rpc:resp:<账号>:<request_id>`，互不串。N 个进程同时 `query_stock_positions` / `get_full_tick` 都行 | **吞吐是共享的**：服务端串行处理（交易类查询排在 adjust 线程上一次一个），谁都不排队的前提是总量不大。多个消费者各自每秒拉一次全市场 `get_full_tick(["SH"])`（~1s 一次）会互相拖慢；这种让一个进程拉、其余订阅它，或开 `full_tick_cache` |
+| **全推行情**（`subscribe_whole_quote`） | 服务端按 `(client_id, sub_id)` 引用计数，同一组合只在 QMT 订一次；推送走 redis pub/sub，**订同一 topic 的所有客户端都收到**；最后一个退订才真退 | 0.3.49 前同机多进程有坑：`client_id` 默认是每用户一份持久化文件，两个进程共用它、`sub_id` 又都从 1 数起，服务端看成一个订阅者，B 退订会把 A 的也拆掉。现在 `sub_id` 带进程号，不再撞；**跨机器**共用同一份配置时仍请各设 `BIGQMT_QUOTE_CLIENT_ID` |
+| **委托/成交回报**（`on_stock_order` 等） | redis stream + pub/sub 按账号广播，每个客户端各起自己的监听线程，都收到全量事件 | 事件是按账号而不是按客户端的：A 下的单 B 也会收到回报，按 `order_remark` / `strategy_name` 自己过滤 |
+
 ### 全市场快照的品种过滤（`types`）
 
 **市场令牌返回的是交易所挂牌的全部标的，股票只占一小部分。** 实测上交所 `"SH"` 共 **26744** 个标的，其中股票 **2315 只（8.7%）**，其余是债券（36%）、回购等。QMT 的耗时严格线性、约 **0.29ms/只**，所以全量要 7.4s，只取股票 0.9s。
@@ -398,7 +408,7 @@ xtdata.get_full_tick(["600000.SH"])               # 显式代码不受影响
 | `etf` | 沪深ETF | 1696 |
 | `fund` | 沪深基金 | 2249 |
 | `index` | 沪深指数 | 609 |
-| `convertible` | 沪深转债 | 320 |
+| `convertible`（别名 `cbond` / `cb`） | 沪深转债 | 320 |
 | `all` | 不收窄，返回交易所全部标的 | 26744（SH） |
 
 **关键在于请求时就收窄，而不是拿回来再过滤**——事后过滤仍要付 QMT 对每个多余标的的 0.29ms。板块清单由 FormulaServer 直连提供（实测 13ms）并按运行缓存，相对省下的时间可以忽略。
@@ -926,6 +936,7 @@ BIGQMT_REDIS_CONFIG = {
 - **主账号 = 策略在 QMT 里绑定的那个**。QMT 的模型交易一个实例只绑一个账号（界面选定），`BIGQMT_ACCOUNT_ID` 必须是它，否则 `passorder` 走的账号和策略绑定的对不上。
 - **交易类请求不并发**。secondary 在后台线程收请求，但 `submit` / `cancel` / 持仓委托查询都 defer 到主账号的 adjust 线程排队执行——`get_trade_detail_data` 离开主线程返回空，这是 QMT 的约束，不是桥的。
 - **撤单按 `account_id` 路由**（#171 起）。此前 `cancel` 一律用网关自己的账号，双账号里撤期货委托会用股票账号发出去。
+- **zmq 也能跑方式一**（#334 起）。副账号在 zmq 下拿自己的端点：端口按副账号派生，和按该账号配置的 zmq 客户端派生的连接地址一致，host 继承主账号 `bind_address` 的；回报轮询走全推通道的 `exec:*` topic。pipe / mysql / shm 没有按账号的寻址，不支持方式一。
 - **副账号的委托/成交回调靠轮询**（#320 起）。大 QMT 的 `order_callback` / `deal_callback` 只回策略绑定的主账号，副账号的单进程里根本看不到。桥在 adjust 拍上每秒对副账号查一次 `get_trade_detail_data`（ORDER / DEAL），状态有变化就发到该账号自己的 `bigqmt:order_events:<副账号>`——`on_stock_order` / `on_stock_trade` / 废单的 `on_order_error` 都有，延迟约一个轮询间隔（`rpc.secondary_exec_poll_seconds`，默认 1 秒），一个间隔内连跳多个状态只发最后一个；要每个中间状态就用方式二。主账号仍是即时回调。
 - **全推行情推送到每个账号**（#315 起）。推送通道按账号命名（`bigqmt:quote_push:<账号>:<topic>`），此前只发主账号的频道，按副账号配置的客户端「订阅成功但无回调」。现在表里每个账号各发一份，客户端不用改。
 - **已实盘验证**：上面这份配置的形状就是一套实际跑着的 STOCK + FUTURE 部署，dual-channel 收发、副账号的 `account_id` 注入、副账号交易请求被主线程 drain 三条路都在实盘走通了。#171 合并时 CHANGELOG 写的"本仓库从未实跑过"已经不再成立。换券商或换账号类型组合时，仍建议先用小单验一遍副账号的下单、撤单、持仓。
@@ -1034,7 +1045,7 @@ xt_trader.cancel_order_stock(acc, order_id)   # 撤单送回的是原始字符�
 
 ### 本项目的扩展（MiniQMT 没有）
 
-这些不是兼容项，是多出来的：`order_stock_result()`（返回完整 dict 而非单个 id）、`order_stock_batch()`、`wait_async_orders()`、`ipo_subscribe_all()`、`sync_deployment()`、`get_deployment_info()`、`query_execution_snapshot()`、`local_cache_stats()`。
+这些不是兼容项，是多出来的：`order_stock_result()`（返回完整 dict 而非单个 id）、`order_stock_batch()`、`wait_async_orders()`、`ipo_subscribe_all()`、`sync_deployment()`、`get_deployment_info()`、`query_execution_snapshot()`、`local_cache_stats()`、`convert_bond()` / `sell_back_bond()`（可转债转股 / 回售，大 QMT passorder opType 80-83，按账户类型自动选普通户/信用户编号；`order_stock` 直接传 80-83 也认）。
 
 ---
 
@@ -1657,6 +1668,7 @@ python test_all_apis.py
 | `RuntimeError: passorder is not available in Big QMT runtime` | QMT 没注入 API 全局 —— 这个文件被当成**普通脚本**执行了 | 加到**模型交易**里运行，别在策略编辑器窗口点运行；检查没勾「独立 python 进程」 |
 | `server_error: passorder submitted but order not found in system` | 委托没进系统。最常见是 QMT 模型交易的**运行模式是「模拟」**（默认值）—— `passorder` 内部撮合，永远到不了券商 | 运行模式改**实盘** |
 | `order_gateway is not configured` | 策略 `init` 挂了 | 看启动日志找真正的异常 |
+| `直接还款 (order_type 32): the repayment amount goes in order_volume as integer yuan, price is ignored` | 归还融资把金额放在了 `price`（#330）。`passorder` 的直接还款金额走 **volume 槽**，`price` 不看 | `order_stock(acc, code, CREDIT_DIRECT_CASH_REPAY, 还款金额, FIX_PRICE, 0, ...)`，金额整数元 |
 | `RequestExpired: ... NOT dispatched` / `TimeoutError: ... The bridge did NOT place this order` | **并发下单撞上串行 `passorder`**（每笔 ~200ms，在 QMT 策略线程上一笔一笔跑）：轮到这单时已过你的超时，桥**拒绝而没下**（#303） | 可安全重试；降并发或加大 `timeout_seconds`。超时后客户端会自动问 `get_request_outcome`，报错里写明下了没下 |
 
 **最常见的是第一条。** 一句话确认：
