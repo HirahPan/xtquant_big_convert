@@ -3172,7 +3172,9 @@ class BigQmtXtData:
         The server-side download is best-effort while the client pull can still
         save it (cache enabled), but with the local cache disabled it is the
         entire job -- its failure raises instead of reporting {finished: total},
-        which would be the fake progress of issue #47.
+        which would be the fake progress of issue #47. With the cache enabled
+        the same applies once the pull comes back empty for a code: a failed
+        download that nothing stood in for raises, naming the codes (#339).
         """
         codes = [str(c) for c in (stock_list or []) if str(c or "").strip()]
         if not codes:
@@ -3271,6 +3273,23 @@ class BigQmtXtData:
                 if ready >= len(batch) or time.time() >= deadline:
                     break
                 time.sleep(1.5)
+            if server_download_error is not None and ready < len(batch):
+                # The server-side download failed AND the pull found nothing
+                # to save for some of the batch: the download did not happen
+                # and nothing stands in for it. Reporting {finished: total}
+                # here is the fake progress of #47 one branch over (#339).
+                # A failed download whose bars were already on the server
+                # still finishes above (ready == len(batch)); an empty code
+                # after a download that did NOT fail keeps the tolerant
+                # timeout (suspended / delisted codes have no bars to wait for).
+                missing = [code for code in batch
+                           if getattr((data or {}).get(code), "shape", (0,))[0] == 0]
+                raise RuntimeError(
+                    "download_history_data2 %s %s~%s: the server-side download "
+                    "failed (%s) and the pull found no rows for %s -- nothing was "
+                    "downloaded for these codes" % (
+                        period, start_time, end_time, server_download_error,
+                        ",".join(missing)))
             for code in batch:
                 finished += 1
                 if callback is not None:
