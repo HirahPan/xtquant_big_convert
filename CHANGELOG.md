@@ -3,6 +3,80 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [0.3.60] - 2026-09-24
+
+### 修复
+
+- **pipe/沙箱部署的最后两处 socket 漏网**（0.3.58 后实盘逐行核对）。（1）客户端事件线程的 redis
+  探测：非 redis 传输且没有显式 redis 配置时，`_exec_events_redis_or_none` 每轮开头仍建 client 并
+  ping 默认的 127.0.0.1:6379——外连即杀的沙箱里一次探测就死；现在整步跳过（不建不 ping）。新增
+  客户端 `_redis_explicit` 判定（合并配置或环境变量给了 host/username/password 任一才算显式）；
+  显式给了的 zmq/pipe + redis 组合探测照旧。全推推送通道同闸：pipe/mysql 且无显式 redis 时明确
+  报错指路（`get_full_tick` 轮询或显式 redis 块），不再默拨。（2）服务端 native xtdata：SDK 调用
+  会拨本地 58610 行情服务，新增 `native_xtdata_enabled` 门——pipe 默认 False（`_native()` 恒 None，
+  `probe_capabilities` 的 native 探测也跳过并写明），显式 True 才开；redis/zmq 默认 True 不变。
+  pipe 部署从本版起不再需要在配置里写 `redis_enabled=False`（0.3.58 起已是默认），库补丁也可以撤了。
+
+## [0.3.59] - 2026-09-24
+
+### 修复
+
+- **公式族进入注入捕获名单与 probe 名单**（#374 收尾）。0.3.57 的「全局优先」漏了前提：
+  `capture_qmt_injected_funcs` 的名单里没有 `call_formula` / `subscribe_formula` /
+  `unsubscribe_formula` / `get_formula_result` / `gen_factor_index`，实盘 `qmt_api` 永远拿不到——
+  0.3.58 实盘复验暴露。补上后：注入了这些全局的终端 RPC 真正走通；没注入的终端
+  `probe_capabilities` 的 `qmt_globals` 直接回答能力问题（本机终端实测五个全 False，
+  call_formula 不可用是终端真实能力，不是路由问题）。
+
+## [0.3.58] - 2026-09-24
+
+### 修复
+
+- **pipe 模式不再向外拨号**（实盘报告：券商沙箱禁 socket，EDR 抓到 `connect()` 杀进程）。审计定位
+  三处：（1）redis 块默认仍在时 exec 事件链路的懒 client 首个命令就拨号——`transport="pipe"` 现在
+  默认不下发 redis 块，显式 `redis_enabled=True` 才保留（zmq/mysql 默认行为不变）；（2）runtime 模块级
+  直挂读取此前不读 `transport` 键，「配了 pipe 实际还在跑 redis」——已补齐并与 `configure_runtime_redis`
+  对齐，同时补读 `pipe` 子配置、`_apply_config` 转发；（3）pipe 下全推推送不再刷 AttributeError 噪音
+  （新增 `NullQuotePushChannel` 静默空通道）。
+
+### 新增
+
+- **独立命名管道单文件打包器** `tools/build_pipe_single_file_flat.py`：flat 真实代码内嵌机制（源码可
+  搜索/阅读/直改），强制 `transport=pipe` + 关 redis/全推推送/下载队列/快照缓存——给禁 socket、禁 pip、
+  外连即杀的券商沙箱一个零外连的单一策略文件。执行回调由客户端轮询合成（#372，0.3.57 起）；全推行情
+  用 `get_full_tick` 轮询。用法：`python tools/build_pipe_single_file_flat.py`，产物
+  `src/BIGQMT_DRYRUN_PIPE_FLAT_ALL_IN_ONE.py`（gitignored，用时重新生成）。
+
+### 验证与未验证
+
+全量单测 2389 passed / 1 skipped（含 pipe 默认丢 redis 块/显式保留/模块级直挂 reload/打包器钉/Null 通道
+等 10 条新回归）；管道单文件构建产物静态验证通过（强制项齐全、gbk 编译通过）。**未在禁 socket 的真沙箱
+里跑过**——本机终端不杀连接；真机部署后启动日志不应再出现任何 redis 连接报错，EDR 应无告警。
+
+## [0.3.57] - 2026-09-24
+
+### 修复
+
+- **`call_formula` 一族在完整大 QMT 上误走 ContextInfo**（#374）。官方入口是注入策略命名空间的
+  全局函数，适配器只查 ContextInfo 就报 `ContextInfo.call_formula is not available`，根本没进公式
+  计算。`call_formula` / `subscribe_formula` / `unsubscribe_formula` / `get_formula_result` /
+  `gen_factor_index` 五个方法改为「注入了全局用全局，没注入才落 ContextInfo」。
+- **`get_full_tick` 大名单 fallback 覆盖显式超时**（#373）。新增 `market_fallback=False`：接受
+  部分行情的调用方可以关掉交易所扩读（部分结果照实返回、原异常原样抛出；默认 `True` 行为不变）；
+  显式 `timeout_seconds` 不再被硬抬到 60s；直读已拿到的行与扩读结果合并（直读优先），不再被空的
+  市场回包整体顶掉。
+- **pipe / mysql 没有推送通道时的执行回调**（#372，轻路）。客户端新增查询轮询器：redis 不可达
+  且非 zmq 时按 `sysid+status` diff 委托、按 `trade_id` diff 成交，合成与推送同形的
+  `on_stock_order` / `on_stock_trade` / `on_order_error`（首轮打底不补发；回调延迟 = 轮询间隔，
+  `BIGQMT_EXEC_POLL_SECONDS` 默认 1s；查询连续失败自动退回外层重选通道）。不改 pipe 协议，
+  mysql 部署同样受益。
+
+### 验证与未验证
+
+全量单测 2379 passed / 1 skipped，三个修复各有针对性回归（含 reporter 给的复现形状）。**未上
+实盘终端**:#374 依赖终端确实提供 call_formula 全局（reporter 已做路由层验证）;#372 的轮询器
+没在禁 socket/文件 io 的真沙箱里跑过——两处都是路由/合成逻辑单测 + reporter 证据，不是终端实测。
+
 ## [0.3.56] - 2026-09-24
 
 ### 修复
