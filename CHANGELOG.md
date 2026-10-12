@@ -3,6 +3,32 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [0.3.64] - 2026-10-10
+
+### 修复
+
+- **`get_instrument` 在终端合约库被污染的机器上对齐 miniQMT 的正确值**（#405 的条件性缓解，
+  @yucejade 报告并贡献 PR #407）。终端侧 `ContextInfo.get_instrumentdetail` 的合约库在个别机器上
+  被污染且重启不自愈（`OpenDate` 返回 0 或借壳/更名日），而同机常驻登录的 miniQMT 行情服务对同批
+  代码全部正确。`get_instrument` 改走既有 `_native_or_context` 模式：native SDK 优先、ContextInfo
+  回落、#160 死标记窗口吸收拨号成本，开关沿用 `native_xtdata_enabled`（redis 传输默认开）。
+  **局限（重要）**：只有同机常驻登录 miniQMT 的部署才受益；没有 miniQMT 的部署行为不变（native
+  拨号失败即回落，每 600 秒窗口付一次拨号成本）。#405 的根治（终端合约库为何被污染、如何刷新）
+  仍开着。
+
+## [0.3.63] - 2026-10-10
+
+### 修复
+
+- **ZMQ 推送通道订阅者泄漏（重订阅阶梯式重复推送）**（#403，@simonfantasy 报告并给出根因与修法）。
+  `ZmqQuotePushChannel._sub_loop` 此前 keyed 在共享实例属性 `_running` 上：`stop()` 置 False，
+  下一次 `start_subscriber()` 置回 True——join 超时（线程卡在 on_msg 回调里）的旧线程看到 True
+  又复活，且挂着它创建时的旧 topic 集合。客户端每次 topic 集合变化都 stop+start，订阅 N 批就
+  留下最多 N-1 个僵尸订阅者，靠前的批被每个僵尸各收一份（实测 1.7×–7× 阶梯复制）。Redis 通道
+  早已是"每个订阅者私有 Event"，ZMQ 这路没跟上。现在对齐：订阅者捕获自己的 Event，join 超时
+  不再泄漏（Event 已置位，回调返回即退出并自闭 socket）；`start_subscriber` 自洽地先停旧的；
+  新增 `active_subscribers()` 诊断（健康值 0 或 1）。
+
 ## [0.3.62] - 2026-10-09
 
 ### 升级注意
