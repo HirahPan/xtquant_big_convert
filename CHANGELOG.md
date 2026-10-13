@@ -3,6 +3,26 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [0.3.65] - 2026-10-13
+
+### 升级注意
+
+- #397 的返回值变化：`download_history_data2` 在追加盲区（窗口终点早于终端本地末根、
+  终端零写入）时不再报 `finished == total`，盲区代码计入新增的 `skipped` 键——
+  依赖 `finished == total` 判完成的调用方请改用 `not result.get('skipped')`。
+
+### 修复
+
+- **shim 补 `query_secu_account`**（#406，@TsqGit 报告，光大 2.1.29）。终端在下单校验与
+  账户会话探测链上按属性名回调 trader 对象的 `query_secu_account`（桥与 xtquant 代码中
+  零命中的运行时探测），缺属性时 AttributeError 中断操作（实盘一只标的下单被迫人工兜底、
+  清算后每 5 分钟一条报错）。实现为 `query_stock_asset` 别名（含 async 变体）。
+- **下载追加盲区不再冒充完成**（#397，@yucejade 报告并附 DAT 级证据）。终端注入下载只会
+  从本地末根向后追加：早于末根的窗口静默零写入但任务报"已受理"，轮询的停牌/退市容忍
+  分支又把空窗口计入 finished——`{'finished': N, 'total': N}` 配零写入。现在空窗口代码
+  经一次合批尾部读甄别：有更新数据 = 追加盲区，计入 `result['skipped']`（不计 finished）
+  并告警；真无数据代码维持原容忍。miniQMT 全窗口语义依赖终端引擎能力，#397 保持开启。
+
 ## [0.3.64] - 2026-10-10
 
 ### 修复
