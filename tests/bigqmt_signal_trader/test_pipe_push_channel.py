@@ -18,6 +18,12 @@ import threading
 import time
 import unittest
 
+import pytest
+
+# Real Windows named pipes: CreateNamedPipeW/CreateFileW do not exist off
+# Windows, so the E2E file skips cleanly there (contributors run macOS/Linux).
+pytestmark = pytest.mark.skipif(os.name != "nt", reason="named pipes are Windows-only")
+
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(ROOT, "src"))

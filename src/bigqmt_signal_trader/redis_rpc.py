@@ -21,6 +21,7 @@ from .adapters.redis_common import decode_text
 from .code_utils import normalize_stock_code
 from . import exec_events as _exec_events
 from .models import AccountSnapshot, OrderRef, OrderRequest
+from . import order_identity_journal as _identity_journal
 
 
 # time.monotonic: unaffected by wall-clock jumps, so a settle deadline
@@ -692,8 +693,9 @@ class BigQmtRpcHandlers:
         # at submit time and read back at query time. The Redis identity store
         # covers restarts and other processes; this covers deployments with no
         # Redis at all (zmq single-file), where attribution used to silently
-        # read "" forever (issue #156 follow-up to #133). Bounded FIFO,
-        # same 24h TTL as the Redis store.
+        # read "" forever (issue #156 follow-up to #133). The runtime enables
+        # a disk journal for Redis-free deployments before serving requests.
+        # Bounded FIFO, same seven-day TTL as the Redis store.
         self._order_identity_local = collections.OrderedDict()
         # Settled-id journal (#299 follow-up): remark -> OrderedDict of the
         # order_sys_ids already handed out for it, insertion-ordered. The
@@ -1818,6 +1820,7 @@ class BigQmtRpcHandlers:
         name. Rows without a remark (hand-placed orders) or without an
         identity record (another process's orders) keep the row's value.
         """
+        self._load_order_identity_journal(account_id)
         rows = list(snapshots or [])
         candidates = [row for row in rows
                       if str(getattr(row, "user_order_id", "") or "").strip()]
@@ -1861,12 +1864,50 @@ class BigQmtRpcHandlers:
     # renamed under the bridge process (#393).
     _ORDER_IDENTITY_LOCAL_TTL_SECONDS = 7 * 86400.0
 
+    def enable_order_identity_persistence(self, directory=None, account_types=None):
+        """Restore Redis-free attribution before the RPC service starts."""
+        from .account_type_map import get_account_type_map, primary_account_type
+
+        self._order_identity_journals = {}
+        self._order_identity_journal_directory = directory
+        if account_types is None:
+            account_types = dict(get_account_type_map())
+        account_types = dict(account_types)
+        account_types.setdefault(self.account_id, self._configured_account_type(self.account_id))
+        for account_id in account_types:
+            self._load_order_identity_journal(
+                account_id, primary_account_type(account_types[account_id]))
+
+    def _load_order_identity_journal(self, account_id, account_type=None):
+        stores = getattr(self, "_order_identity_journals", None)
+        if stores is None:
+            return None
+        account_id = str(account_id or "")
+        if account_id in stores:
+            return stores[account_id]
+        store = _identity_journal.OrderIdentityJournal(
+            account_id,
+            self._configured_account_type(account_id) if account_type is None else account_type,
+            directory=self._order_identity_journal_directory,
+            ttl_seconds=self._ORDER_IDENTITY_LOCAL_TTL_SECONDS,
+            limit=self._ORDER_IDENTITY_LOCAL_LIMIT)
+        stores[account_id] = store
+        journal = self._order_identity_local
+        for key, entry in store.load().items():
+            existing = journal.get(key)
+            if existing is None or (entry[1] and not existing[1]):
+                journal[key] = entry
+        while len(journal) > self._ORDER_IDENTITY_LOCAL_LIMIT:
+            journal.popitem(last=False)
+        return store
+
     def _remember_order_identity_local(self, account_id, remark, strategy_name):
         remark = str(remark or "").strip()
         if not remark:
             return
         key = (str(account_id or ""), remark)
         try:
+            store = self._load_order_identity_journal(account_id)
             journal = getattr(self, "_order_identity_local", None)
             if journal is None:
                 # Tests (and the QMT sandbox) build handlers via __new__ and
@@ -1874,7 +1915,8 @@ class BigQmtRpcHandlers:
                 journal = self._order_identity_local = collections.OrderedDict()
             name = str(strategy_name or "")
             existing = journal.get(key)
-            if existing is not None:
+            now = time.time()
+            if existing is not None and now - existing[0] <= self._ORDER_IDENTITY_LOCAL_TTL_SECONDS:
                 existing_name = existing[1]
                 if existing_name and existing_name != name:
                     # First NAMED record wins (#393): a reused remark must
@@ -1889,10 +1931,12 @@ class BigQmtRpcHandlers:
                               % (remark, existing_name, name))
                     journal.move_to_end(key)
                     return
-            journal[key] = (time.time(), name)
+            journal[key] = (now, name)
             journal.move_to_end(key)
             while len(journal) > self._ORDER_IDENTITY_LOCAL_LIMIT:
                 journal.popitem(last=False)
+            if store is not None:
+                store.remember(account_id, remark, now, name)
         except Exception:
             pass
 
@@ -2499,6 +2543,13 @@ class BigQmtRpcHandlers:
             "identity_redis_wired": redis_client is not None,
             "local_journal_size": len(journal),
         }
+        store = self._load_order_identity_journal(account_id)
+        if store is not None:
+            out["local_persistence_enabled"] = True
+            out["local_persistence_directory"] = store.directory
+            out["local_persistence_error"] = store.error
+            journal = self._order_identity_local
+            out["local_journal_size"] = len(journal)
         if not remark:
             out["note"] = "pass remark=<the order's remark> to check the key"
             return out
@@ -2508,7 +2559,10 @@ class BigQmtRpcHandlers:
         out["identity_key"] = key
         if redis_client is not None:
             try:
-                out["redis_hit"] = bool(redis_client.get(key))
+                identity = _exec_events._read_order_identity(redis_client, account_id, remark)
+                out["redis_hit"] = bool(identity)
+                if identity:
+                    out["redis_strategy_name"] = str(identity.get("strategy_name") or "")
             except Exception as exc:
                 out["redis_hit"] = None
                 out["lookup_error"] = "%s: %s" % (exc.__class__.__name__, exc)
@@ -2679,22 +2733,29 @@ class BigQmtRpcHandlers:
             print("%s 直接还款: amount=%d taken from order_volume; price=%r is ignored "
                   "by passorder (#330)" % ("[bigqmt_rpc]", request.volume, request.price))
 
+        identity = None
+        identity_redis = self._identity_redis()
         try:
-            from .exec_events import remember_order_identity
-
-            remember_order_identity(
-                self._identity_redis(),
+            identity = _exec_events.remember_order_identity(
+                identity_redis,
                 request.account_id,
                 request.remark,
                 strategy_name=request.strategy_name,
                 stock_code=request.stock_code,
             )
-        except Exception:
-            pass
+            if identity is None and identity_redis is not None:
+                # A repeated remark retained an existing record. A fresh
+                # process must cache THAT name, or its new local journal
+                # would override Redis and rename the old order again.
+                identity = _exec_events._read_order_identity(
+                    identity_redis, request.account_id, request.remark)
+        except Exception as exc:
+            _exec_events._warn_order_identity(exc)
         # Always journal locally too -- cheap, and the only attribution a
         # no-Redis deployment has (issue #156).
         self._remember_order_identity_local(
-            request.account_id, request.remark, request.strategy_name)
+            request.account_id, request.remark,
+            (identity or {}).get("strategy_name") or request.strategy_name)
 
         # Taken before passorder so every callback / row this order produces
         # is at or after it; an entry from an earlier same-remark order is

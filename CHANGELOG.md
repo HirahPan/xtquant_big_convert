@@ -2,6 +2,33 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
+## [0.3.68] - 2026-10-15
+
+### 修复
+
+- **QMT 内 Redis 响应过滤导致重启后备注仍无法恢复**：`order_remarks` 的 Lua 返回值
+  复用 v0.3.67 身份记录的无数字编码，避免原始 JSON 在 Python 收到前被拒绝。只编码返回值，
+  新旧关联的存储内容和剩余 TTL 不变，无需迁移；原生非空备注优先、冲突拒绝、整批失败保留
+  原生值及 250ms 不重试池不变。升级需同步完整包（含共用编码模块）并 reload 或重启策略；
+  未观察、已过期或 Redis 丢失的备注仍不能恢复。已通过响应过滤替身、隔离 Redis Lua 和
+  Python 3.6 编译预检，实际 QMT 响应过滤与自然重启恢复仍待终端验收。
+
+
+## [0.3.67] - 2026-10-15
+
+### 修复
+
+- **重启后 strategy_name 回落为 QMT 策略名**（#393）：身份记录改为无数字安全编码，
+  避免 QMT 内置 Redis 响应过滤器拒绝读取含股票代码的 JSON。查询、执行回调、重复 remark
+  检查及 `probe_order_identity` 统一读取；被拦截的旧 JSON 在 Redis 内原子迁移，保留内容和
+  剩余 TTL。Redis 禁用 EVAL 时保留原记录并报告诊断错误。
+- **纯 pipe 等无 Redis 部署的重启恢复**：下单前同步追加本地身份 journal，启动时按账户和
+  账户类型恢复七天内的策略归属；remark 与委托参数保持原值。写入失败通过日志和
+  `probe_order_identity.local_persistence_error` 报告。默认保存在 QMT `python/state/order_identity`
+  下，可用 `BIGQMT_ORDER_IDENTITY_DIR` 指定稳定目录。部署包含策略文件，须重启策略一次；
+  已过期或从未持久化的历史映射无法凭空恢复。已通过隔离 Redis、进程重启及沙箱兼容测试。
+  2026-10-15 已在国金 QMT 的纯 pipe、无 Redis 模式用真实委托验证：策略重启后策略名和
+  备注保持原值，持久化无错误（测试单已撤、成交 0）。QMT 内 Redis 旧值迁移路径尚待实测。
 
 ## [0.3.66] - 2026-10-13
 

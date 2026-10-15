@@ -383,6 +383,21 @@ def _perform_reload(context_info):
         if identity_journal:
             new_handlers = getattr(_rpc_service, "handlers", None)
             if new_handlers is not None:
+                # init may have recovered entries written by another process.
+                # Keep those too, together with old memory-only entries whose
+                # disk write failed. A valid first name still owns its remark.
+                recovered = getattr(new_handlers, "_order_identity_local", None) or {}
+                now = time.time()
+                ttl = getattr(new_handlers, "_ORDER_IDENTITY_LOCAL_TTL_SECONDS", 7 * 86400)
+                for key, entry in recovered.items():
+                    old_entry = identity_journal.get(key)
+                    if (old_entry is None or now - old_entry[0] > ttl
+                            or (entry[1] and not old_entry[1])
+                            or (entry[1] == old_entry[1] and entry[0] > old_entry[0])):
+                        identity_journal[key] = entry
+                limit = getattr(new_handlers, "_ORDER_IDENTITY_LOCAL_LIMIT", 5000)
+                while len(identity_journal) > limit:
+                    identity_journal.popitem(last=False)
                 new_handlers._order_identity_local = identity_journal
                 print("[bigqmt_reload] order identity journal carried across "
                       "(%d entries)" % len(identity_journal))
@@ -715,6 +730,7 @@ def _build_rpc_service(context_info, app, config):
         "bigqmt_signal_trader.full_tick_cache",
         "bigqmt_signal_trader.download_jobs",
         "bigqmt_signal_trader.order_remarks",
+        "bigqmt_signal_trader.order_identity_journal",
         "bigqmt_signal_trader.exec_events",
     ):
         try:
@@ -807,6 +823,11 @@ def _build_rpc_service(context_info, app, config):
     handlers.download_job_redis_client = _store_redis
     handlers.order_identity_redis_client = _store_redis
     handlers.order_remark_redis_client = _exec_events.bounded_identity_client(_store_redis)
+    if _store_redis is None:
+        # Pipe and other Redis-free transports need a durable source after a
+        # real strategy/process restart, when the in-memory journal is gone.
+        handlers.enable_order_identity_persistence(
+            directory=rpc_config.get("order_identity_dir"))
     # Settlement reads the callback-fed watch table first (issue #164).
     handlers.order_watch_table = _order_watch_table
     # Whether _pump_download_jobs will actually run queued jobs. The submit RPC
