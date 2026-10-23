@@ -2,6 +2,21 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
+## [0.3.72] - 2026-10-23
+
+### 修复
+
+- **按线程建的传输连接随线程退出释放**（#431，@erlou96 报告）。客户端每条线程第一次
+  RPC 时自建一条连接，但连接句柄只随进程退出回收：客户端每死一条线程，服务端白留一条连接
+  （background 模式还搭一个工作线程），churn 场景一路积到实例上限后新连接永远建不成——
+  报告里的「内存溢出」实际是服务端的线程/句柄耗尽。现在每条连接按 `(ident, token)` 注册，
+  线程退出时由 thread-local finalizer 即时关闭，新建连接前再兜底清扫死线程残留；ident 与
+  句柄值都会被系统回收复用，释放必须 token 全等，不会错杀复用位上的活连接。
+- **`trader.stop()` 关闭底层 RPC transport**（#431 同案）。原来只排干异步单、停事件线程，
+  transport 实例活到进程退出，守规矩的单线程客户端一样泄漏一条连接。新增
+  `BigQmtRpcClient.close()`（幂等，再使用时惰性重建），`BigQmtXtTrader.stop()` 调用它。
+  实盘（lemo 同机零依赖部署，0.3.71 桥）：6 线程 churn 后注册表零残留，`stop()` 后连接全关。
+
 ## [0.3.71] - 2026-10-20
 
 ### 修复
@@ -23,15 +38,15 @@
   `xtdata.unsubscribe_quotes(seqs)`：本地表一次移除、一次 RPC、一次 topic 重同步；服务端
   只释放本客户端的命名引用（共享组合的同机其它订阅者不受影响，`quote_unsubscribe_all`
   维持最后手段语义不变），报告 `{released, unknown, native_errors}`——未知 id 与原生
-  退订异常点名上报不再吞掉；replay 快照后已释放的句柄不再被订回。实盘（pipe 部署）：
+  退订异常点名上报不再吞掉；replay 快照后已释放的句柄不再被订回。实盘（同机零依赖部署）：
   5 订阅批量退订 282ms 完成、服务端组合清零。
 
 ## [0.3.69] - 2026-10-19
 
 ### 修复
 
-- **pipe 传输在缺 `ctypes.wintypes.HANDLE`/`BOOL` 的券商内置 Python 上直接可用**（#419，
-  @vx0532 报告）：部分 QMT 内置 3.6 裁掉了这两个类型，切管道即 AttributeError。
+- **同机零依赖传输在缺 `ctypes.wintypes.HANDLE`/`BOOL` 的券商内置 Python 上直接可用**（#419，
+  @vx0532 报告）：部分 QMT 内置 3.6 裁掉了这两个类型，启用即 AttributeError。
   以 c_void_p / c_int32 兜底（与原生同类同宽），完整 build 零变化。
 - **FileIO 禁令沙箱里 loader 的真实错误不再被 UnboundLocalError 掩盖**（#420，
   @yuchiwang 报告）：`open()` 被拒时 `source` 从未赋值，token 检查反手抛
@@ -48,15 +63,15 @@
   缺失/冲突为 0.45/0.73ms，均无 DataError。禁用/失败的 EVAL 回退路径及单读仍可能慢。
   升级同步完整包并 reload（单文件部署重新生成）；无需迁移，完整回滚仍可读取新写入
   的身份记录。Lua/Python 内部回复须同步更新，避免手工混搭；回滚旧版会恢复性能问题。
-- **pipe 部署的 RPC handlers 仍会拨 58610，QMT 弹 `非法IP:127.0.0.1:58610` 并冻结策略线程**：
+- **无 socket 部署的 RPC handlers 仍会拨 58610，QMT 弹 `非法IP:127.0.0.1:58610` 并冻结策略线程**：
   `_build_rpc_service` 为 handlers 单独构造了一个 `BigQmtMarketDataProvider`，没有像
   `adapter_factory.build_app` 那样按 `transport` 传入 `native_xtdata_enabled`，于是构造器默认的
   `True` 生效。`get_instrument_detail` 走原生优先的 `get_instrument`，加载 QMT 自带 xtdata SDK 后
   `get_client()` 拨 SDK `xtdata.ini` 里的 `127.0.0.1:58610`；终端把这次外连判为非法，弹模态警告并
   卡住 QMT 主线程，后续 K 线/行情/资产/持仓/委托请求全部超时（客户端显示 `rpc failed` 空错误）。
   现在 handlers 与下载补种的 provider 都按 `rpc.native_xtdata_enabled` 显式覆盖、否则跟随
-  `transport != "pipe"`，与 `adapter_factory` 同一规则；补 `test_socket_gates` 覆盖 helper 规则、
-  pipe 默认关闭和显式覆盖。已在 QMT（Wine）终端用弹窗、终端日志与 12:18 那次 RPC 时间线定位；
+  `transport` 非该模式，与 `adapter_factory` 同一规则；补 `test_socket_gates` 覆盖 helper 规则、
+  默认关闭和显式覆盖。已在 QMT（Wine）终端用弹窗、终端日志与 12:18 那次 RPC 时间线定位；
   修复后的终端复验待做。
 
 ## [0.3.68] - 2026-10-15
@@ -78,12 +93,12 @@
   避免 QMT 内置 Redis 响应过滤器拒绝读取含股票代码的 JSON。查询、执行回调、重复 remark
   检查及 `probe_order_identity` 统一读取；被拦截的旧 JSON 在 Redis 内原子迁移，保留内容和
   剩余 TTL。Redis 禁用 EVAL 时保留原记录并报告诊断错误。
-- **纯 pipe 等无 Redis 部署的重启恢复**：下单前同步追加本地身份 journal，启动时按账户和
+- **无 Redis 部署的重启恢复**：下单前同步追加本地身份 journal，启动时按账户和
   账户类型恢复七天内的策略归属；remark 与委托参数保持原值。写入失败通过日志和
   `probe_order_identity.local_persistence_error` 报告。默认保存在 QMT `python/state/order_identity`
   下，可用 `BIGQMT_ORDER_IDENTITY_DIR` 指定稳定目录。部署包含策略文件，须重启策略一次；
   已过期或从未持久化的历史映射无法凭空恢复。已通过隔离 Redis、进程重启及沙箱兼容测试。
-  2026-10-15 已在国金 QMT 的纯 pipe、无 Redis 模式用真实委托验证：策略重启后策略名和
+  2026-10-15 已在国金 QMT 的无 Redis 模式用真实委托验证：策略重启后策略名和
   备注保持原值，持久化无错误（测试单已撤、成交 0）。QMT 内 Redis 旧值迁移路径尚待实测。
 
 ## [0.3.66] - 2026-10-13
