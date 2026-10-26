@@ -2,6 +2,31 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
+## [0.3.75] - 2026-10-26
+
+### 修复
+
+- **Python 3.12 终端多股票财务/十大股东返回形状兼容**：3.12 运行时（pandas 3）下
+  ContextInfo 的 get_financial_data / get_top10_share_holder / get_market_data 多股票
+  场景由 pandas.Panel 改为 MultiIndex DataFrame（Panel 自 pandas 1.0 起移除）。旧
+  序列化分支对 MultiIndex 走 reset_index，元组列名被拍平成字符串——客户端拿到
+  "('000002.SZ', 'close')" 这样的列，无法按代码取子表（2.1.33 实盘实测）。现在识别
+  MultiIndex 列后按第一级拆分、复用既有 Panel 信封，客户端零改动重建为
+  {代码: DataFrame}——与新旧两代 pandas 都服务的 df[代码] 子表形状一致。单股票
+  路径不受影响（原本就是普通 DataFrame）。
+
+## [0.3.74] - 2026-10-26
+
+### 修复
+
+- **get_local_data 盘中补回缺失的当日形成日线**（#226/#307 家族的 1d 情形）：
+  客户端缓存在当日开盘前写下的帧整天原样返回，最后一根停在上一个交易日——
+  download_history_data2 只更新服务端数据，从不刷新客户端缓存。现在读取时若
+  最后一根早于当日且请求窗口覆盖今天（交易日 09:15..15:05），当日形成 bar 从
+  实时日线读取补回到返回帧（不回写缓存）。守卫与降级与多日周期补救一致：实时
+  读取失败或为空时保留原答案并告警一次；历史窗口（end_time 早于今天）不追加。
+  2.1.33 终端实测：旧版 54 根止于上一交易日，修复版 55 根含当日盘中部分量。
+
 ## [0.3.73] - 2026-10-24
 
 ### 文档与测试
